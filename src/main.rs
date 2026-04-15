@@ -1,17 +1,17 @@
 // an implementation of the union file system from docker in rust
 use std::{
     cell::RefCell,
-    collections::BTreeMap,
-    fs::{self, DirEntry, File, read_dir},
+    collections::{BTreeMap, HashMap},
+    fs::{self, DirEntry, File, OpenOptions, read_dir},
     io,
-    os::{linux::fs::MetadataExt, unix::fs::MetadataExt},
-    path::Path,
-    sync::atomic::AtomicU64,
+    os::linux::fs::MetadataExt,
+    path::{Path, PathBuf},
     time::SystemTime,
     vec,
 };
 
-use fuser::{Errno, INodeNo};
+use fuser::{Errno, FileType, INodeNo};
+use rand::random;
 
 const BLOCK_SIZE: u32 = 4096;
 
@@ -39,7 +39,6 @@ struct InodeMetadata {
     kind: FileKind,
     mode: u16,
     hard_links: u32,
-    uid: u32,
 }
 
 impl From<InodeMetadata> for fuser::FileAttr {
@@ -54,8 +53,8 @@ impl From<InodeMetadata> for fuser::FileAttr {
             kind: attr.kind.into(),
             perm: attr.mode,
             nlink: attr.hard_links,
-            uid: attr.uid, // do not use
-            gid: 0,        // do not use this
+            uid: 0, // do not use
+            gid: 0, // do not use this
             blksize: BLOCK_SIZE,
             flags: 0,
             rdev: 0,                  // no clue what this is
@@ -64,107 +63,131 @@ impl From<InodeMetadata> for fuser::FileAttr {
     }
 }
 
-// the name of the string stored should be the full path, and not just the file name because there
-// can be files in different directories with the same name
-//
-// directories also the same analogy where you need to have the full path upto that point
-type readable_fs_directory = BTreeMap<Vec<u8>, (u64, FileKind)>;
+struct UnionFS {
+    base_readable_structure: String,
+    next_file_handle: u64,
+    next_process_id: u64,
+    list_of_current_processes: HashMap<u64, process_state>, // matches a particular process to its respective process_state struct
+}
 
-fn file_exists(btree: &BTreeMap<Vec<u8>, (u64, FileKind)>, file_name: &String) -> bool {
-    btree.get(file_name.as_bytes()).is_some()
+// implementing the write only layer :
+impl UnionFS {
+    fn new(&self, base: String) -> UnionFS {
+        UnionFS {
+            base_readable_structure: base,
+            next_file_handle: 1,
+            next_process_id: 1,
+            list_of_current_processes: HashMap::new(),
+        }
+    }
+
+    fn new_proc(&mut self) {
+        println!("The process id allocated : {}", self.next_process_id);
+        let new_proc_state = process_state::new(self.next_process_id);
+        self.list_of_current_processes
+            .insert(self.next_process_id, new_proc_state);
+        self.next_process_id += 1;
+    }
+
+    fn increment_file_handle(&mut self) {
+        self.next_file_handle += 1;
+    }
 }
 
 struct process_state {
-    process_id: u64,                                    //basically a container
-    superBlock: u64, // the superBlock which allocates the new inode number
-    writable_files: BTreeMap<Vec<u8>, (u64, FileKind)>, // each writable file or directory under a particular process is stored here
+    process_id: u64,                    //basically a container
+    superBlock: u64,                    // the superBlock which allocates the new inode number
+    file_mapping: HashMap<u64, String>, // mapping of an inode to the path in the writable path
+    writable_path: String,
 }
 
 impl process_state {
-    fn new(&mut self, process_number_to_be_given: u64) -> process_state {
+    fn new(process_number_to_be_given: u64) -> process_state {
         println!(
             "new process with process id : {} created",
             process_number_to_be_given
         );
+        let mut final_path = String::from("writable_path_");
+        final_path += &process_number_to_be_given.to_string();
+        let r: u64 = random();
+        final_path += &r.to_string();
         process_state {
             process_id: process_number_to_be_given,
             superBlock: 1,
-            writable_files: BTreeMap::new(),
+            file_mapping: HashMap::new(),
+            writable_path: final_path,
         }
+    }
+
+    fn init_path(&mut self) {
+        /*
+                let root = InodeMetadata {
+                    inode_val: INodeNo::ROOT.0,
+                    open_file_handles: 0,
+                    size: 0,
+                    last_modified: SystemTime::now(),
+                    last_accessed: SystemTime::now(),
+                    last_metadata_change: SystemTime::now(),
+                    kind: FileKind::Directory,
+                    mode: 0o777,
+                    hard_links: 2,
+                };
+        */
+        let mut path = self.writable_path.clone();
+        let tmp = String::from("/");
+        path += &tmp;
+
+        self.allocate_dir(path);
     }
 
     fn increment_superblock_val(&mut self) {
         self.superBlock += 1;
     }
 
-    fn add_file_to_Btree(
-        &mut self,
-        file_name: String,
-        file_type: String,
-        inode_number: u64,
-    ) -> Errno {
-        let mut btree_instance = &mut self.writable_files;
-        if file_type.to_lowercase() == "file" {
-            btree_instance.insert(
-                file_name.as_bytes().to_vec(),
-                (inode_number, FileKind::file),
-            );
-            return Errno::EEXIST;
-        } else if file_type.to_lowercase() == "directory" {
-            btree_instance.insert(
-                file_name.as_bytes().to_vec(),
-                (inode_number, FileKind::Directory),
-            );
-            return Errno::EEXIST;
-        }
-        println!("can only add files and directories");
-        Errno::EINVAL
+    fn add_to_file_mapping(&mut self, new_file_inode: u64, path_of_file: String) {
+        self.file_mapping.insert(new_file_inode, path_of_file);
     }
 
-    fn delete_file_from_btree(&mut self, file_name: String) -> Errno {
-        let btree_instance = &mut self.writable_files;
-        let state = file_exists(btree_instance, &file_name);
-
-        if !state {
-            println!("file does not exist");
-            return Errno::ENOENT;
-        }
-        let _ = btree_instance.remove(file_name.as_bytes()).unwrap();
-        Errno::EEXIST
+    fn allocate_dir(&mut self, path: String) {
+        let mut comp_path = PathBuf::from(&self.writable_path);
+        comp_path.push(path);
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(comp_path)
+            .unwrap();
     }
 
-    fn search(&self, name: &String) -> bool {
-        file_exists(&self.writable_files, name)
-    }
-}
-
-// contains the writable layers implementation
-struct UnionFS {
-    data_dir: String,
-    next_file_handle: AtomicU64,
-    next_process_id: u64,
-}
-
-// implementing the write only layer :
-//
-// read from the read only layer clone it and then add it here
-
-impl UnionFS {
-    fn new(&self, new_data_dir: String) -> UnionFS {
-        UnionFS {
-            data_dir: new_data_dir,
-            next_file_handle: AtomicU64::from(1),
-            next_process_id: 1,
+    fn get_dir_content(&self, path: String) -> Result<Vec<String>, Errno> {
+        let path = PathBuf::from(path);
+        let mut v: Vec<String> = Vec::new();
+        if path.is_dir() {
+            let dir_iter = fs::read_dir(path).unwrap();
+            for val in dir_iter {
+                let val = val.unwrap();
+                let file_name = val.file_name().into_string().unwrap();
+                v.push(file_name);
+            }
+            return Ok(v);
+        } else {
+            return Err(fuser::Errno::ENOENT);
         }
     }
 
-    fn get_inode();
-    fn content_part();
-    fn metadata_part();
-    fn get_directory_content();
-    fn lookup_name();
-
-    fn insert_copied_data();
+    // makes a new file, adds the inode and path to the hash map and returns the inode_val
+    fn allocate_file(&mut self, path: String) -> u64 {
+        let mut comp_path = PathBuf::from(&self.writable_path);
+        comp_path.push(path);
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(&comp_path)
+            .unwrap();
+        let tmp = file.metadata().unwrap();
+        self.add_to_file_mapping(tmp.st_ino(), comp_path.display().to_string());
+        tmp.st_ino()
+    }
 }
 
 fn visited_files(dir: &Path, cb: &dyn Fn(&mut DirEntry)) -> io::Result<()> {
@@ -185,7 +208,7 @@ fn visited_files(dir: &Path, cb: &dyn Fn(&mut DirEntry)) -> io::Result<()> {
 fn visited_dirs(
     dir: &Path,
     cb: &dyn Fn(&mut DirEntry),
-    mut dir_vec: &mut Vec<String>,
+    dir_vec: &mut Vec<String>,
 ) -> io::Result<()> {
     if dir.is_dir() {
         for entry in read_dir(dir)? {
@@ -211,9 +234,8 @@ fn main() {
     // will be redirected to the appropriate process based write path
 
     let path = Path::new("underlying_data"); // hardcode value for now
-    let readable_part = File::open(path).unwrap();
-    let mut readable_B_tree: BTreeMap<Vec<u8>, (u64, FileKind)> = BTreeMap::new();
-    let mut all_files: RefCell<Vec<String>> = RefCell::new(vec![]);
+    let mut readable_b_tree: BTreeMap<Vec<u8>, (u64, FileKind)> = BTreeMap::new();
+    let all_files: RefCell<Vec<String>> = RefCell::new(vec![]);
 
     let _ = visited_files(path, &mut |visit| {
         let tmp = visit.path().clone().to_str().unwrap().to_string();
@@ -227,7 +249,7 @@ fn main() {
         let tmp = x.metadata().unwrap();
         let inode_number = tmp.st_ino();
         //let file_type = tmp.file_type();
-        readable_B_tree.insert(test.as_bytes().to_vec(), (inode_number, FileKind::file));
+        readable_b_tree.insert(test.as_bytes().to_vec(), (inode_number, FileKind::file));
     }
     // all files from the readable b tree inserted
     let mut all_dirs: Vec<String> = Vec::new();
@@ -243,9 +265,12 @@ fn main() {
         let path = Path::new(v_dirs);
         let tmp = fs::metadata(path).unwrap();
         let inode_number = tmp.st_ino();
-        readable_B_tree.insert(
+        readable_b_tree.insert(
             v_dirs.as_bytes().to_vec(),
             (inode_number, FileKind::Directory),
         );
     }
+
+    // need to make a mapping from the readable inode to writable inode
+    let mappings: HashMap<u64, u64> = HashMap::new();
 }

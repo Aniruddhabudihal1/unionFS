@@ -9,3 +9,4 @@ fs = "0.0.5"
 fuser = { version = "0.17.0", features = ["serde"] }
 serde = {version = "1.0.228", features = ["derive"]}
 libc = "0.2.184"
+rand = "0.10.1"
