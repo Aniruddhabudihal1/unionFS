@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 fs = "0.0.5"
 libc = "0.2.184"
+fuser = "0.17.0"
