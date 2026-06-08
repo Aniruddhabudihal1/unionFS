@@ -221,89 +221,115 @@ impl Filesystem for unionFS {
     }
 }
 
-fn make_dir_attribute(inode_val: u64) -> FileAttr {
+fn make_attribute(inode_val: u64, dir: bool) -> FileAttr {
     let now = SystemTime::now();
-    FileAttr {
-        ino: INodeNo(inode_val),
-        size: 0,
-        blocks: 0,
-        atime: now,
-        mtime: now,
-        ctime: now,
-        crtime: now,
-        kind: FileType::Directory,
-        perm: 0o755,
-        nlink: 0,
-        uid: 0,
-        gid: 0,
-        rdev: 0,
-        blksize: 512,
-        flags: 0,
+
+    if dir {
+        FileAttr {
+            ino: INodeNo(inode_val),
+            size: 0,
+            blocks: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            crtime: now,
+            kind: FileType::Directory,
+            perm: 0o755,
+            nlink: 0,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            blksize: 512,
+            flags: 0,
+        }
+    } else {
+        FileAttr {
+            ino: INodeNo(inode_val),
+            size: 0,
+            blocks: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            crtime: now,
+            kind: FileType::RegularFile,
+            perm: 0o755,
+            nlink: 0,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            blksize: 512,
+            flags: 0,
+        }
     }
 }
 
-// have to peroform a .is_dir() on this before calling this
-fn make_base_writable_path(
-    parent_inode_value: u64,
-    base_pathname: PathBuf,
-    pathname: PathBuf,
-    mut list: Vec<PathBuf>,
+// the goal of this is to recursively search for all the children of the directories and then add
+// them to the vector
+//
+// each directory has a hash node mapping of : name (string) -> inode value (u64)
+//
+// then in the global state of the file system there is a mapping of : inode value (u64) -> InodeContent
+
+fn instantiate_fs(
     uf: &mut unionFS,
+    primary_pathname: PathBuf,
+    //_secondary_pathname: PathBuf,
+    mut list: Vec<PathBuf>,
+    parent_inode_value: u64,
 ) -> Vec<PathBuf> {
-    println!("The base pathname is : {:?}", &base_pathname);
-    println!("The generic pathname is : {:?}", &pathname);
-    let foo2 = fs::read_dir(&pathname);
-    match foo2 {
+    let the_dir_instance = fs::read_dir(&primary_pathname);
+    match the_dir_instance {
         Ok(r) => {
-            for bar in r {
-                let name_cropped = &bar
-                    .unwrap()
-                    .path()
-                    .to_path_buf()
-                    .strip_prefix(&base_pathname)
-                    .unwrap()
-                    .to_path_buf();
-                println!("name : {}", name_cropped.to_string_lossy());
+            for i in r {
+                let next_inode_val = uf.next_inode_value;
+                uf.next_inode_value += 1;
 
-                if base_pathname.is_dir() {
-                    list.push(name_cropped.clone());
-                    // here I need to add this directory to the parents hash_of_children and also
-                    // assign it an inode value : which keeps track of the string name to inode
-                    // mapping, that function will then return the inode number that was assigned
-                    // to this directory
-                    // subsequently this inode value is then passed into the next
-                    // make_base_writable_path, which will go on doing this
-                    //
-                    // I also need to make a separate function which does the same for the files
+                if let Some(parent_inode_instance) = uf.mapping.get_mut(&parent_inode_value) {
+                    if let Some(parent_mapping) =
+                        parent_inode_instance.node_kind.actual_access_to_children()
+                    {
+                        parent_mapping.insert(
+                            i.as_ref().unwrap().file_name().into_string().unwrap(),
+                            next_inode_val,
+                        );
+                        list.push(i.as_ref().unwrap().file_name().into());
 
-                    let new_inode_val = uf.fill_up_hashes(
-                        name_cropped.to_string_lossy().to_string(),
-                        parent_inode_value,
-                    );
+                        let type_of_file = i.as_ref().unwrap().metadata().unwrap().is_dir();
+                        if type_of_file {
+                            let hm_instance: HashMap<String, u64> = HashMap::new();
+                            let inode_instance = InodeContent {
+                                inode_attributes: make_attribute(next_inode_val, true),
+                                node_kind: Node::Directory {
+                                    hash_of_children: hm_instance,
+                                },
+                            };
+                            uf.mapping.insert(next_inode_val, inode_instance);
 
-                    println!("does not come here");
-
-                    let mut new_hm: HashMap<String, u64> = HashMap::new();
-                    let tmp = make_dir_attribute(new_inode_val);
-                    let tmp2: InodeContent = InodeContent {
-                        inode_attributes: tmp,
-                        node_kind: Node::Directory {
-                            hash_of_children: new_hm,
-                        },
-                    };
-                    uf.mapping.insert(new_inode_val, tmp2);
-
-                    list = make_base_writable_path(
-                        new_inode_val,
-                        base_pathname.clone(),
-                        name_cropped.to_path_buf(),
-                        list,
-                        uf,
-                    );
+                            list = instantiate_fs(uf, i.unwrap().path(), list, next_inode_val);
+                        } else {
+                            println!(
+                                "its a file and its path is {}",
+                                i.as_ref().unwrap().path().to_string_lossy()
+                            );
+                            let tmp = i.unwrap().path();
+                            let file_contents = fs::read_to_string(tmp).unwrap();
+                            let inode_instance = InodeContent {
+                                inode_attributes: make_attribute(next_inode_val, false),
+                                node_kind: Node::File {
+                                    file_content: file_contents,
+                                },
+                            };
+                            uf.mapping.insert(next_inode_val, inode_instance);
+                        }
+                    } else {
+                        println!("parent hashmap does not exist");
+                    }
+                } else {
+                    println!("no such parent inode number : {}", parent_inode_value);
                 }
             }
         }
-        Err(_) => println!("check if the path is an actual directory"),
+        Err(e) => println!("something went wrong and gave the following error : {}", e),
     }
     list
 }
@@ -318,12 +344,11 @@ fn main() {
 
     let mut list_of_directories: Vec<PathBuf> = Vec::new();
     if pathname.is_dir() {
-        list_of_directories = make_base_writable_path(
-            1,
-            pathname.clone(),
-            pathname.clone(),
-            list_of_directories,
+        list_of_directories = instantiate_fs(
             &mut fileSystem_instance,
+            pathToBeMounted.into(),
+            list_of_directories,
+            1,
         );
     }
 
