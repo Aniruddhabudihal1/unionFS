@@ -1,7 +1,8 @@
 use fuser::{Config, Errno, FileAttr, FileType, Filesystem, Generation, INodeNo, MountOption};
 use std::{
     collections::HashMap,
-    env, fs,
+    env,
+    fs::{self},
     path::PathBuf,
     sync::{LockResult, RwLock, RwLockReadGuard, RwLockWriteGuard},
     time::{Duration, SystemTime},
@@ -61,9 +62,9 @@ impl InodeContent {
 
 struct unionFS {
     primary_pathname: RwLock<PathBuf>,
-    next_inode_value: RwLock<u64>,
     session_id_mapping: RwLock<HashMap<String, u64>>,
     mapping: RwLock<HashMap<u64, InodeContent>>,
+    curr_inode_val: RwLock<u64>,
 }
 
 impl unionFS {
@@ -102,17 +103,9 @@ impl unionFS {
             primary_pathname: primary_pathname.to_path_buf().into(),
             mapping: RwLock::new(primary_mapping),
             session_id_mapping: RwLock::new(session_id_maps),
-            next_inode_value: RwLock::new(1),
+            curr_inode_val: RwLock::new(1),
         }
     }
-
-    fn increment_global_inode_val(&self) -> u64 {
-        let cur_inode = self.next_inode_value.read().unwrap().clone();
-        let mut tmp = self.next_inode_value.write().unwrap();
-        *tmp += 1;
-        cur_inode
-    }
-
     /*
     fn instantiate_for_a_session_id(&mut self, re: &Request, ses_id: String, rep: ReplyEntry) {
         let tmp1 = &self.primary_pathname;
@@ -150,6 +143,11 @@ impl unionFS {
     }
 }
 
+fn increment_global_inode_val(mut val: RwLockWriteGuard<u64>) {
+    *val += 1;
+    drop(val);
+}
+
 fn identify_session_id(pid: String) -> String {
     let mut session_id_path: String = String::from("/proc/");
     session_id_path.push_str(&pid);
@@ -172,70 +170,47 @@ fn identify_session_id(pid: String) -> String {
 impl Filesystem for unionFS {
     fn lookup(
         &self,
-        req: &fuser::Request,
+        _req: &fuser::Request,
         parent: INodeNo,
         name: &std::ffi::OsStr,
         reply: fuser::ReplyEntry,
     ) {
-        let p: String = req.pid().to_string();
-        let session_id = identify_session_id(p);
-        println!("The session id identified is : {}", session_id);
-
         let name_local_format = name.to_string_lossy().to_string();
         println!(
             "lookup function got invoked for : {} and its parent inode value is : {}",
             name_local_format, parent.0
         );
 
-        /*
-        if let Some(_tmp_instace) = self.session_id_mapping.borrow().get(&session_id) {
-            println!("handle the case where the session id exists")
-        } else {
-            let mut tmp1 = self.primary_pathname.clone();
+        println!("The content in the parent is : ");
 
-            let tmp2 = self.next_inode_value.borrow_mut().to_owned();
-            let tmpp = self.next_inode_value.borrow_mut().clone() + 1;
-            self.next_inode_value.replace(tmpp);
+        let it = self.mapping.read().unwrap();
 
-            let f = make_attribute(tmp2, false);
-
-            let s = self
-                .session_id_mapping
-                .borrow_mut()
-                .insert(session_id, tmp2);
-            let hm: HashMap<String, u64> = HashMap::new();
-            let inode_instance = InodeContent {
-                inode_attributes: f,
-                node_kind: Node::Directory {
-                    hash_of_children: hm.into(),
-                },
-            };
-            self.mapping.borrow_mut().insert(tmp2, inode_instance);
-
-            let v: Vec<PathBuf> = Vec::new();
-
-            let _ = instantiate_fs(self, tmp1.get_mut(), tmp2, true, &v);
+        for i in it.iter() {
+            println!();
+            println!("{:?}", i);
         }
-        */
 
-        let possible_inode_content = self.mapping.read().unwrap();
-        if let Some(parent) = possible_inode_content.get(&parent.0) {
-            if let Some(child) = parent
-                .node_kind
-                .just_access_children_without_editing_anything()
-            {
-                let inode_vall = child.unwrap().get(&name_local_format).unwrap().clone();
+        let global_instance = self.mapping.read().unwrap();
+        let parent_content = global_instance
+            .get(&parent.0)
+            .unwrap()
+            .node_kind
+            .just_access_children_without_editing_anything()
+            .unwrap()
+            .unwrap();
 
-                let i_content = possible_inode_content.get(&inode_vall).unwrap().clone();
+        let child = parent_content.get(&name_local_format);
+        match child {
+            Some(i) => {
+                let glob = self.mapping.read().unwrap();
+                let child_actual = glob.get(i).unwrap().inode_attributes;
                 let dur = Duration::default();
-                reply.entry(&dur, &i_content.inode_attributes, Generation(1));
-            } else {
-                println!("child does not exist ");
+                reply.entry(&dur, &child_actual, Generation(1));
+            }
+            None => {
+                println!("{} Does not exist", name_local_format);
                 reply.error(Errno::ENOENT);
             }
-        } else {
-            println!("parent does not exist");
-            reply.error(Errno::ENOENT);
         }
     }
 
@@ -260,12 +235,14 @@ impl Filesystem for unionFS {
         for (i, ii) in tmp {
             let ft = ii.get_inode_kind();
 
+            //println!("when inserting into ")
             aggregate.push((*i, ft, i.to_string()));
         }
         aggregate.push((ino.0, FileType::Directory, ".".to_string()));
         aggregate.push((ino.0, FileType::Directory, "..".to_string()));
 
         for (i, entry) in aggregate.into_iter().enumerate().skip(offset as usize) {
+            println!("hello");
             if reply.add(INodeNo(entry.0), (i + 1) as u64, entry.1, entry.2) {
                 break;
             }
@@ -370,175 +347,133 @@ fn instantiate_fs(
     file_system_instance: &unionFS,
     path: &PathBuf,
     parent_inode_value: u64,
-    input_vec: &mut Vec<PathBuf>,
-    do_only_dir: bool,
-) -> Vec<PathBuf> {
+    _do_only_dir: bool,
+) {
     let dir_iter = fs::read_dir(path).unwrap();
+    println!("current path is : {}", path.to_string_lossy());
+
+    let parent_val = parent_inode_value.clone();
+    {
+        let next_val = file_system_instance.curr_inode_val.try_write().unwrap();
+        increment_global_inode_val(next_val);
+    }
+    // write lock dropped here
 
     for dir_instance in dir_iter {
         let pathh = dir_instance.unwrap().path();
         let str_path = file_system_instance.strip(pathh.clone());
+
         // need to add this child of the parent in 2 hash maps :
         // parents mapping of : name -> inode value
         // global mapping of inode value -> InodeContent
 
-        let mut global_state = file_system_instance.mapping.write().unwrap();
-
-        if let Some(parent_inodeinstance) = global_state.get_mut(&parent_inode_value) {
-            let mut parent_hash = parent_inodeinstance
-                .node_kind
-                .actual_access_to_children()
-                .unwrap()
-                .unwrap();
-            file_system_instance.increment_global_inode_val();
-            if !pathh.is_dir() && !do_only_dir {
-                parent_hash.insert(
-                    str_path.clone(),
-                    *file_system_instance.next_inode_value.read().unwrap(),
-                );
-
-                let file_attr = make_attribute(
-                    *file_system_instance.next_inode_value.read().unwrap(),
-                    false,
-                );
-
-                let actual_content = fs::read_to_string(&pathh).unwrap();
-
-                let new_node = InodeContent {
-                    inode_attributes: file_attr,
-                    node_kind: Node::File {
-                        file_content: actual_content,
-                    },
-                };
-
-                let mut second_global_state = file_system_instance.mapping.write().unwrap();
-                second_global_state.insert(
-                    *file_system_instance.next_inode_value.read().unwrap(),
-                    new_node,
-                );
-            } else if pathh.is_dir() {
-                println!("Directory detected with name : {:?}", pathh.clone());
-                parent_hash.insert(
-                    str_path.clone(),
-                    *file_system_instance.next_inode_value.read().unwrap(),
-                );
-
-                let file_attr =
-                    make_attribute(*file_system_instance.next_inode_value.read().unwrap(), true);
-
-                let new_hm: HashMap<String, u64> = HashMap::new();
-
-                let new_node = InodeContent {
-                    inode_attributes: file_attr,
-                    node_kind: Node::Directory {
-                        hash_of_children: RwLock::new(new_hm),
-                    },
-                };
-
-                let mut second_global_state = file_system_instance.mapping.write().unwrap();
-                second_global_state.insert(
-                    *file_system_instance.next_inode_value.read().unwrap(),
-                    new_node,
-                );
-                input_vec.push(pathh.clone());
-
-                *input_vec = instantiate_fs(
-                    file_system_instance,
-                    &pathh.clone(),
-                    *file_system_instance.next_inode_value.read().unwrap(),
-                    input_vec,
-                    false,
+        {
+            if pathh.is_file() {
+                increment_global_inode_val(
+                    file_system_instance.curr_inode_val.try_write().unwrap(),
                 );
             }
-        } else {
-            println!("parent does not exist");
+            let mut global_state = file_system_instance.mapping.try_write().unwrap();
+
+            if let Some(parent_inodeinstance) = global_state.get_mut(&parent_val) {
+                let mut parent_hash = parent_inodeinstance
+                    .node_kind
+                    .actual_access_to_children()
+                    .unwrap()
+                    .unwrap();
+
+                println!(
+                    "The name of the thing being inserted : {} and the inode value being given to it is : {}",
+                    str_path.clone(),
+                    *file_system_instance.curr_inode_val.read().unwrap()
+                );
+
+                parent_hash.insert(
+                    str_path.clone(),
+                    *file_system_instance.curr_inode_val.read().unwrap(),
+                );
+            } else {
+                println!("parent does not exist");
+            }
         }
-    }
-    input_vec.to_vec()
-}
+        // write lock dropped here
 
-/*
+        if pathh.is_file() {
+            println!("file detected");
+            let file_attr =
+                make_attribute(*file_system_instance.curr_inode_val.read().unwrap(), false);
 
-fn instantiate_fs<'a>(
-    uf: &unionFS,
-    primary_pathname: &PathBuf,
-    parent_inode_value: u64,
-    do_only_dir: bool,
-    inp_vec: &'a Vec<PathBuf>,
-) -> &'a Vec<PathBuf> {
-    let the_dir_instance = fs::read_dir(primary_pathname);
-    match the_dir_instance {
-        Ok(r) => {
-            for i in r {
-                let next_inode_val = uf.next_inode_value.borrow_mut();
-                let mut f = uf.next_inode_value.borrow().clone();
-                println!("works till here");
-                f += 1;
-                uf.next_inode_value.replace(f);
+            let actual_content = fs::read_to_string(&pathh).unwrap();
 
-                if let Some(parent_inode_instance) = uf.mapping.take().get_mut(&parent_inode_value)
-                {
-                    if let Some(parent_mapping) =
-                        parent_inode_instance.node_kind.actual_access_to_children()
-                    {
-                        parent_mapping.insert(
-                            i.as_ref().unwrap().file_name().into_string().unwrap(),
-                            next_inode_val.to_owned(),
+            let new_node = InodeContent {
+                inode_attributes: file_attr,
+                node_kind: Node::File {
+                    file_content: actual_content,
+                },
+            };
+
+            {
+                let second_global_state = file_system_instance.mapping.try_write();
+                match second_global_state {
+                    Ok(mut r) => {
+                        r.insert(
+                            *file_system_instance.curr_inode_val.read().unwrap(),
+                            new_node,
                         );
-
-                        inp_vec.clone().push(i.as_ref().unwrap().path());
-
-                        let is_it_a_dir = i.as_ref().unwrap().metadata().unwrap().is_dir();
-                        if is_it_a_dir {
-                            let hm_instance: HashMap<String, u64> = HashMap::new();
-                            let inode_instance = InodeContent {
-                                inode_attributes: make_attribute(next_inode_val.to_owned(), true),
-                                node_kind: Node::Directory {
-                                    hash_of_children: hm_instance.into(),
-                                },
-                            };
-                            uf.mapping
-                                .take()
-                                .insert(next_inode_val.to_owned(), inode_instance);
-
-                            instantiate_fs(
-                                uf,
-                                &i.unwrap().path(),
-                                next_inode_val.to_owned(),
-                                do_only_dir,
-                                inp_vec,
-                            );
-                        } else if !do_only_dir {
-                            println!(
-                                "its a file and its path is {}",
-                                i.as_ref().unwrap().path().to_string_lossy()
-                            );
-                            let tmp = i.unwrap().path();
-                            let file_contents = fs::read_to_string(tmp).unwrap();
-                            let inode_instance = InodeContent {
-                                inode_attributes: make_attribute(next_inode_val.to_owned(), false),
-                                node_kind: Node::File {
-                                    file_content: file_contents,
-                                },
-                            };
-                            uf.mapping
-                                .borrow_mut()
-                                .insert(next_inode_val.to_owned(), inode_instance);
-                        }
-                    } else {
-                        println!("parent hashmap does not exist");
+                        drop(r);
                     }
-                } else {
-                    println!("no such parent inode number : {}", parent_inode_value);
+                    Err(er) => {
+                        println!(
+                            "An error ocurred when trying to add file to the mapping\n{}",
+                            er
+                        );
+                    }
                 }
             }
-        }
-        Err(e) => println!("something went wrong and gave the following error : {}", e),
-    }
-    inp_vec
-}
+            // write lock dropped here
+        } else if pathh.is_dir() {
+            println!("Directory detected with name : {:?}", pathh.clone());
+            println!("And the path name is {}", str_path.clone());
+            let file_attr =
+                make_attribute(*file_system_instance.curr_inode_val.read().unwrap(), true);
 
-*/
+            let new_hm: HashMap<String, u64> = HashMap::new();
+
+            let new_node = InodeContent {
+                inode_attributes: file_attr,
+                node_kind: Node::Directory {
+                    hash_of_children: RwLock::new(new_hm),
+                },
+            };
+
+            {
+                let second_global_state = file_system_instance.mapping.try_write();
+                match second_global_state {
+                    Ok(mut t) => {
+                        println!("ok now it inserted and its no longer poisoned");
+                        t.insert(
+                            *file_system_instance.curr_inode_val.read().unwrap(),
+                            new_node,
+                        );
+                        drop(t);
+                    }
+                    Err(er) => {
+                        println!("the error is this : {}", er);
+                    }
+                }
+            }
+            // write dropped here
+
+            println!(
+                "the inode value being inserted is : {}",
+                file_system_instance.curr_inode_val.read().unwrap().clone()
+            );
+            //input_vec.push(pathh.clone());
+            let tmp = file_system_instance.curr_inode_val.read().unwrap().clone();
+            instantiate_fs(file_system_instance, &pathh.clone(), tmp, false);
+        }
+    }
+}
 
 fn main() {
     let cmdline_args: Vec<String> = env::args().collect();
@@ -548,17 +483,15 @@ fn main() {
 
     let fileSystem_instance = unionFS::new(pathname.clone());
 
-    let mut v: Vec<PathBuf> = Vec::new();
-
     if pathname.is_dir() {
-        let _ = instantiate_fs(&fileSystem_instance, &pathname, 1, &mut v, false);
+        instantiate_fs(&fileSystem_instance, &pathname, 1, false);
     }
 
     let mut cfg = Config::default();
     let mut v = vec![MountOption::RW, MountOption::AutoUnmount];
     cfg.mount_options = v;
     cfg.acl = fuser::SessionACL::All;
-    cfg.n_threads = Some(2);
+    cfg.n_threads = Some(1);
     cfg.clone_fd = false;
 
     fuser::mount2(fileSystem_instance, pathname.clone(), &cfg).unwrap();

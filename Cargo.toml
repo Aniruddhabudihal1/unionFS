@@ -6,7 +6,3 @@ edition = "2024"
 [dependencies]
 fs = "0.0.5"
 fuser = "0.17.0"
-procfs = "0.18.0"
-
-[profiles.release]
-debug = true
