@@ -5,6 +5,7 @@ use fuser::{
 
 use procfs::process::Process;
 use std::{
+    cmp::min,
     collections::HashMap,
     env, fs,
     path::PathBuf,
@@ -437,16 +438,8 @@ impl Filesystem for UnionFs {
                         let global_state = self.inode_to_content_mapping.try_read().unwrap();
                         let attr = global_state.get(&readable_inode.unwrap()).unwrap();
                         if attr.get_inode_kind() == FileType::RegularFile {
-                            println!(
-                                "yes its a file,now inserting the global writable parents inode"
-                            );
                             let mut tmp = self.writable_instance_of_parent.try_write().unwrap();
                             *tmp = Some(*writable_root_instance);
-
-                            println!();
-                            println!("Just checking something");
-                            println!();
-                            println!("{:?}", attr);
                         }
                         reply.entry(&dur, &attr.inode_attributes, Generation(1));
                     } else {
@@ -520,6 +513,7 @@ impl Filesystem for UnionFs {
         let mut readable_vec: Vec<String> = Vec::new();
         let mut aggregate: Vec<(u64, FileType, String)> = Vec::new();
         let writable_to_readable_instance = self.writable_to_readable_inode.try_read().unwrap();
+
         if let Some(ttmp) = writable_to_readable_instance.get(&ino.0) {
             if let Some(relative_readable_inode) = ttmp {
                 println!("Found relative readable inode value");
@@ -624,21 +618,16 @@ impl Filesystem for UnionFs {
         reply.attr(&dur, &at);
     }
 
-    /*
-     * spec of what write needs to do :
-     *
-     *
-     * */
     fn write(
         &self,
         _req: &fuser::Request,
         ino: INodeNo,
-        fh: fuser::FileHandle,
+        _fh: fuser::FileHandle,
         offset: u64,
         data: &[u8],
         write_flags: fuser::WriteFlags,
         flags: fuser::OpenFlags,
-        lock_owner: Option<fuser::LockOwner>,
+        _lock_owner: Option<fuser::LockOwner>,
         reply: fuser::ReplyWrite,
     ) {
         let mut present_in_writable_path = None;
@@ -663,10 +652,9 @@ impl Filesystem for UnionFs {
         }
 
         if present_in_readable_path.unwrap() && !present_in_writable_path.unwrap() {
-            let mut cur = None;
             {
                 increment_global_inode_val(self.curr_inode_val.try_write().unwrap());
-                cur = Some(*self.curr_inode_val.try_read().unwrap());
+                Some(*self.curr_inode_val.try_read().unwrap());
             }
 
             let mut inode_contentt: Option<InodeContent> = None;
@@ -682,7 +670,7 @@ impl Filesystem for UnionFs {
                     .try_read()
                     .unwrap();
 
-                let attrs = make_attribute(cur.unwrap(), false);
+                let attrs = make_attribute(*self.curr_inode_val.try_read().unwrap(), false);
                 let node = Node::File {
                     file_content: readable_content.clone().into(),
                     is_this_in_readable_path: false,
@@ -694,24 +682,27 @@ impl Filesystem for UnionFs {
                     node_kind: node,
                 });
             }
+
             {
+                let cur = *self.curr_inode_val.try_read().unwrap();
                 let mut global_mapper = self.inode_to_content_mapping.try_write().unwrap();
 
-                global_mapper.insert(cur.unwrap(), inode_contentt.unwrap());
+                global_mapper.insert(cur, inode_contentt.unwrap());
                 let mut tmp = self.inode_to_string_mapping.try_write().unwrap();
                 let name = tmp.get(&ino.0).unwrap().clone();
-                tmp.insert(cur.unwrap(), name.clone());
+                tmp.insert(cur, name.clone());
 
                 let parent_inode_val = *self.writable_instance_of_parent.try_read().unwrap();
                 let parent = global_mapper.get(&parent_inode_val.unwrap()).unwrap();
                 let children = parent.node_kind.children_of_directory().unwrap();
                 let mut hm = children.try_write().unwrap();
-                hm.insert(name, cur.unwrap());
+                hm.insert(name, cur);
             }
 
             {
+                let cur = *self.curr_inode_val.try_read().unwrap();
                 let mut global_mapper = self.inode_to_content_mapping.try_write().unwrap();
-                let content = global_mapper.get_mut(&cur.unwrap()).unwrap();
+                let content = global_mapper.get_mut(&cur).unwrap();
 
                 let mut node_instance = content
                     .node_kind
@@ -758,17 +749,21 @@ impl Filesystem for UnionFs {
     fn open(
         &self,
         _req: &fuser::Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         _flags: fuser::OpenFlags,
         reply: fuser::ReplyOpen,
     ) {
-        println!("enters the open function");
+        println!(
+            "enters the open function and the respective inode value is : {}",
+            ino.0
+        );
+
         {
             increment_global_file_handle(self.curr_file_handle.try_write().unwrap());
         }
         reply.opened(
             FileHandle(*self.curr_file_handle.try_read().unwrap()),
-            FopenFlags::FOPEN_PARALLEL_DIRECT_WRITES,
+            FopenFlags::FOPEN_DIRECT_IO,
         );
     }
 
@@ -777,21 +772,34 @@ impl Filesystem for UnionFs {
         _req: &fuser::Request,
         ino: INodeNo,
         _fh: fuser::FileHandle,
-        _offset: u64,
-        _size: u32,
+        offset: u64,
+        size: u32,
         _flags: fuser::OpenFlags,
         _lock_owner: Option<fuser::LockOwner>,
         reply: fuser::ReplyData,
     ) {
+        println!("The read function got invoked");
         let global_instance = self.inode_to_content_mapping.try_read().unwrap();
         let node_instance = &global_instance.get(&ino.0).unwrap().node_kind;
-        let content = node_instance
+        let mut content = node_instance
             .get_file_content()
             .unwrap()
             .try_read()
             .unwrap()
             .clone();
-        reply.data(&content);
+
+        let size_of_the_content = content.len();
+        let read_size = min(
+            size,
+            size_of_the_content.saturating_sub(offset as usize) as u32,
+        );
+
+        let buffer = content.split_off(offset as usize);
+
+        let mut tmp = self.writable_instance_of_parent.try_write().unwrap();
+        *tmp = None;
+
+        reply.data(&buffer);
     }
 
     fn rename(
