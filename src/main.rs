@@ -8,6 +8,7 @@ use std::{
     cmp::min,
     collections::HashMap,
     env, fs,
+    hash::Hash,
     path::PathBuf,
     sync::{RwLock, RwLockWriteGuard},
     time::{Duration, SystemTime},
@@ -22,6 +23,7 @@ enum Node {
         file_content: RwLock<Vec<u8>>,
         is_this_in_readable_path: bool,
         is_this_in_writable_path: bool,
+        writable_parent_instance: RwLock<HashMap<i32, u64>>,
     },
 }
 
@@ -37,6 +39,37 @@ impl Node {
         match self {
             Node::Directory { .. } => None,
             Node::File { file_content, .. } => Some(file_content),
+        }
+    }
+
+    fn update_writable_parent_instance(&self, ses_id: i32, writable_parent: u64) {
+        match self {
+            Self::Directory { .. } => {}
+            Self::File {
+                writable_parent_instance,
+                ..
+            } => {
+                writable_parent_instance
+                    .try_write()
+                    .unwrap()
+                    .insert(ses_id, writable_parent);
+            }
+        }
+    }
+
+    fn get_writable_parent_instance(&self, ses_id: i32) -> Option<u64> {
+        match self {
+            Self::Directory { .. } => None,
+            Self::File {
+                writable_parent_instance,
+                ..
+            } => Some(
+                *writable_parent_instance
+                    .try_read()
+                    .unwrap()
+                    .get(&ses_id)
+                    .unwrap(),
+            ),
         }
     }
 
@@ -83,7 +116,6 @@ struct UnionFs {
     inode_to_string_mapping: RwLock<HashMap<u64, String>>,
     curr_inode_val: RwLock<u64>,
     writable_to_readable_inode: RwLock<HashMap<u64, Option<u64>>>,
-    writable_instance_of_parent: RwLock<Option<u64>>,
     curr_file_handle: RwLock<u64>,
 }
 
@@ -125,10 +157,6 @@ impl UnionFs {
 
         let mapping_of_inodes: HashMap<u64, Option<u64>> = HashMap::new();
 
-        // it is by design an Option because it will allow you to encode wether it should be
-        // reading the writable instance of the parent
-        let writable_parent_instance_inode_val: Option<u64> = None;
-
         UnionFs {
             primary_pathname: primary_pathname.to_path_buf().into(),
             inode_to_content_mapping: RwLock::new(primary_mapping),
@@ -136,7 +164,6 @@ impl UnionFs {
             session_id_mapping: RwLock::new(session_id_maps),
             curr_inode_val: RwLock::new(1),
             writable_to_readable_inode: RwLock::new(mapping_of_inodes),
-            writable_instance_of_parent: RwLock::new(writable_parent_instance_inode_val),
             curr_file_handle: RwLock::new(0),
         }
     }
@@ -356,6 +383,7 @@ impl Filesystem for UnionFs {
             if let Ok(stat) = proc.stat() {
                 ses_id = stat.tty_nr;
                 println!("The session id is : {}", ses_id);
+
                 let mut ses_maps = self.session_id_mapping.try_write().unwrap();
 
                 if let Some(res) = ses_maps.get(&ses_id) {
@@ -416,6 +444,7 @@ impl Filesystem for UnionFs {
                     } else {
                         println!("Not found in readable path");
                     }
+
                     if let Some(writable_result) =
                         self.check_writable_path(*writable_root_instance, str_name.clone())
                     {
@@ -438,8 +467,9 @@ impl Filesystem for UnionFs {
                         let global_state = self.inode_to_content_mapping.try_read().unwrap();
                         let attr = global_state.get(&readable_inode.unwrap()).unwrap();
                         if attr.get_inode_kind() == FileType::RegularFile {
-                            let mut tmp = self.writable_instance_of_parent.try_write().unwrap();
-                            *tmp = Some(*writable_root_instance);
+                            let tmmp = attr
+                                .node_kind
+                                .update_writable_parent_instance(ses_id, parent.0);
                         }
                         reply.entry(&dur, &attr.inode_attributes, Generation(1));
                     } else {
@@ -484,8 +514,12 @@ impl Filesystem for UnionFs {
                         );
                         let global_instance = self.inode_to_content_mapping.try_read().unwrap();
                         let attr = global_instance.get(&readable_inode.unwrap()).unwrap();
-                        let mut global = self.writable_instance_of_parent.try_write().unwrap();
-                        *global = Some(parent.0);
+
+                        if attr.get_inode_kind() == FileType::RegularFile {
+                            attr.node_kind
+                                .update_writable_parent_instance(ses_id, parent.0);
+                        }
+
                         reply.entry(&dur, &attr.inode_attributes, Generation(1));
                     } else {
                         reply.error(Errno::ENOENT);
@@ -620,13 +654,13 @@ impl Filesystem for UnionFs {
 
     fn write(
         &self,
-        _req: &fuser::Request,
+        req: &fuser::Request,
         ino: INodeNo,
         _fh: fuser::FileHandle,
         offset: u64,
         data: &[u8],
-        write_flags: fuser::WriteFlags,
-        flags: fuser::OpenFlags,
+        _write_flags: fuser::WriteFlags,
+        _flags: fuser::OpenFlags,
         _lock_owner: Option<fuser::LockOwner>,
         reply: fuser::ReplyWrite,
     ) {
@@ -652,10 +686,7 @@ impl Filesystem for UnionFs {
         }
 
         if present_in_readable_path.unwrap() && !present_in_writable_path.unwrap() {
-            {
-                increment_global_inode_val(self.curr_inode_val.try_write().unwrap());
-                Some(*self.curr_inode_val.try_read().unwrap());
-            }
+            increment_global_inode_val(self.curr_inode_val.try_write().unwrap());
 
             let mut inode_contentt: Option<InodeContent> = None;
 
@@ -671,10 +702,12 @@ impl Filesystem for UnionFs {
                     .unwrap();
 
                 let attrs = make_attribute(*self.curr_inode_val.try_read().unwrap(), false);
+                let bait_hm: RwLock<HashMap<i32, u64>> = RwLock::new(HashMap::new());
                 let node = Node::File {
                     file_content: readable_content.clone().into(),
                     is_this_in_readable_path: false,
                     is_this_in_writable_path: true,
+                    writable_parent_instance: bait_hm,
                 };
 
                 inode_contentt = Some(InodeContent {
@@ -691,12 +724,61 @@ impl Filesystem for UnionFs {
                 let mut tmp = self.inode_to_string_mapping.try_write().unwrap();
                 let name = tmp.get(&ino.0).unwrap().clone();
                 tmp.insert(cur, name.clone());
+            }
 
-                let parent_inode_val = *self.writable_instance_of_parent.try_read().unwrap();
-                let parent = global_mapper.get(&parent_inode_val.unwrap()).unwrap();
-                let children = parent.node_kind.children_of_directory().unwrap();
-                let mut hm = children.try_write().unwrap();
-                hm.insert(name, cur);
+            {
+                let global_mapper = self.inode_to_content_mapping.try_read().unwrap();
+                let tmp = global_mapper.get(&ino.0).unwrap();
+                let inode_instance_of_readable_node = &tmp.node_kind;
+
+                let comm_pid = req.pid() as i32;
+                println!("The request pid is : {}", comm_pid);
+                let ses_id: i32;
+
+                if let Ok(proc) = Process::new(comm_pid)
+                    && let Ok(stat) = proc.stat()
+                {
+                    ses_id = stat.tty_nr;
+                    println!("The session id is : {}", ses_id);
+                    let writable_parent_instance = inode_instance_of_readable_node
+                        .get_writable_parent_instance(ses_id)
+                        .unwrap();
+
+                    let tmp = global_mapper.get(&writable_parent_instance).unwrap();
+
+                    let inode_string_mapping = self.inode_to_string_mapping.try_read().unwrap();
+                    let name = inode_string_mapping.get(&ino.0).unwrap().clone();
+
+                    let mut children_hm = tmp
+                        .node_kind
+                        .children_of_directory()
+                        .unwrap()
+                        .try_write()
+                        .unwrap();
+                    children_hm.insert(name, *self.curr_inode_val.try_read().unwrap());
+
+                    let node = global_mapper
+                        .get(&self.curr_inode_val.try_read().unwrap())
+                        .unwrap();
+
+                    let readable_content = inode_instance_of_readable_node
+                        .get_file_content()
+                        .unwrap()
+                        .try_read()
+                        .unwrap();
+
+                    let readable_iter = readable_content.iter();
+
+                    let mut writable_instance_content = node
+                        .node_kind
+                        .get_file_content()
+                        .unwrap()
+                        .try_write()
+                        .unwrap();
+                    for vec_instance in readable_iter {
+                        writable_instance_content.push(*vec_instance);
+                    }
+                }
             }
 
             {
@@ -710,6 +792,7 @@ impl Filesystem for UnionFs {
                     .unwrap()
                     .try_write()
                     .unwrap();
+
                 let mut start = offset as usize;
                 let initial_start_count = start;
                 let data_to_be_inserted = data.iter();
@@ -732,16 +815,16 @@ impl Filesystem for UnionFs {
                     .unwrap()
                     .try_write()
                     .unwrap();
-                let mut start = offset as usize;
-                let initial_start_count = start;
-                let data_to_be_inserted = data.iter();
-                let mut written_amount = 0;
-                for i in data_to_be_inserted {
-                    start += 1;
-                    node_instance.insert(start, *i);
+
+                let tmp = data.iter();
+                let mut counter = offset as usize;
+                let mut from_zero = 0 as usize;
+                for i in tmp {
+                    node_instance.insert(counter, *i);
+                    counter += 1;
+                    from_zero += 1;
                 }
-                written_amount = start - initial_start_count;
-                reply.written(written_amount.try_into().unwrap());
+                reply.written(from_zero as u32);
             }
         }
     }
@@ -796,9 +879,6 @@ impl Filesystem for UnionFs {
 
         let buffer = content.split_off(offset as usize);
 
-        let mut tmp = self.writable_instance_of_parent.try_write().unwrap();
-        *tmp = None;
-
         reply.data(&buffer);
     }
 
@@ -832,7 +912,12 @@ impl Filesystem for UnionFs {
         name: &std::ffi::OsStr,
         reply: fuser::ReplyEmpty,
     ) {
-        //TODO : need to complete
+        /*
+         * How I am going to approach this :
+         *
+         *
+         *
+         * */
     }
 
     fn mknod(
@@ -845,26 +930,13 @@ impl Filesystem for UnionFs {
         _rdev: u32,
         reply: fuser::ReplyEntry,
     ) {
+        println!("calling mknod for {}", name.to_string_lossy());
         {
             increment_global_inode_val(self.curr_inode_val.try_write().unwrap());
         }
         let new_inode_val = *self.curr_inode_val.try_read().unwrap();
 
-        let tmp = self.writable_instance_of_parent.try_read().unwrap();
-        if tmp.is_some() {
-            let writable_parent = tmp.unwrap();
-            let parent_instance = self.inode_to_content_mapping.try_read().unwrap();
-            let mut parent_hm = parent_instance
-                .get(&writable_parent)
-                .unwrap()
-                .node_kind
-                .children_of_directory()
-                .unwrap()
-                .try_write()
-                .unwrap();
-
-            parent_hm.insert(name.to_string_lossy().to_string(), new_inode_val);
-        } else if tmp.is_none() {
+        {
             let parent_instance = self.inode_to_content_mapping.try_read().unwrap();
             let mut parent_hm = parent_instance
                 .get(&parent.0)
@@ -877,15 +949,18 @@ impl Filesystem for UnionFs {
 
             parent_hm.insert(name.to_string_lossy().to_string(), new_inode_val);
         }
+
         let mut global_indode_mapping = self.inode_to_content_mapping.try_write().unwrap();
         let new_vec: RwLock<Vec<u8>> = RwLock::new(Vec::new());
         let new_attrs = make_attribute(new_inode_val, false);
+        let bait_hm: RwLock<HashMap<i32, u64>> = RwLock::new(HashMap::new());
         let new_inodecontent = InodeContent {
             inode_attributes: new_attrs,
             node_kind: Node::File {
                 file_content: new_vec,
                 is_this_in_readable_path: false,
                 is_this_in_writable_path: true,
+                writable_parent_instance: bait_hm,
             },
         };
         global_indode_mapping.insert(new_inode_val, new_inodecontent);
@@ -893,8 +968,6 @@ impl Filesystem for UnionFs {
         let mut writable_to_readable_instance =
             self.writable_to_readable_inode.try_write().unwrap();
         writable_to_readable_instance.insert(new_inode_val, None);
-        //let mut instance = self.writable_instance_of_parent.try_write().unwrap();
-        //*instance = None;
         let dur = Duration::default();
         reply.entry(&dur, &new_attrs, Generation(1));
     }
@@ -921,7 +994,52 @@ impl Filesystem for UnionFs {
         flags: i32,
         reply: fuser::ReplyCreate,
     ) {
-        //TODO: Need to complete
+        println!("calling create for {}", name.to_string_lossy());
+        {
+            increment_global_inode_val(self.curr_inode_val.try_write().unwrap());
+        }
+        let new_inode_val = *self.curr_inode_val.try_read().unwrap();
+
+        {
+            let parent_instance = self.inode_to_content_mapping.try_read().unwrap();
+            let mut parent_hm = parent_instance
+                .get(&parent.0)
+                .unwrap()
+                .node_kind
+                .children_of_directory()
+                .unwrap()
+                .try_write()
+                .unwrap();
+
+            parent_hm.insert(name.to_string_lossy().to_string(), new_inode_val);
+        }
+
+        let mut global_indode_mapping = self.inode_to_content_mapping.try_write().unwrap();
+        let new_vec: RwLock<Vec<u8>> = RwLock::new(Vec::new());
+        let new_attrs = make_attribute(new_inode_val, false);
+        let bait_hm: RwLock<HashMap<i32, u64>> = RwLock::new(HashMap::new());
+        let new_inodecontent = InodeContent {
+            inode_attributes: new_attrs,
+            node_kind: Node::File {
+                file_content: new_vec,
+                is_this_in_readable_path: false,
+                is_this_in_writable_path: true,
+                writable_parent_instance: bait_hm,
+            },
+        };
+        global_indode_mapping.insert(new_inode_val, new_inodecontent);
+
+        let mut writable_to_readable_instance =
+            self.writable_to_readable_inode.try_write().unwrap();
+        writable_to_readable_instance.insert(new_inode_val, None);
+        let dur = Duration::default();
+        reply.created(
+            &dur,
+            &new_attrs,
+            Generation(0),
+            FileHandle(*self.curr_file_handle.try_read().unwrap()),
+            FopenFlags::FOPEN_DIRECT_IO,
+        );
     }
 
     fn statfs(&self, _req: &fuser::Request, _ino: INodeNo, reply: fuser::ReplyStatfs) {
@@ -1010,6 +1128,11 @@ fn instantiate_fs(file_system_instance: &UnionFs, path: &PathBuf, parent_inode_v
                         *file_system_instance.curr_inode_val.read().unwrap(),
                         str_child_path.clone(),
                     );
+                    println!(
+                        "inserted name for : {} as {}",
+                        *file_system_instance.curr_inode_val.read().unwrap(),
+                        str_child_path.clone()
+                    );
 
                     if let Some(parent_inodeinstance) = global_state.get_mut(&parent_val) {
                         let mut parent_hash = parent_inodeinstance
@@ -1044,6 +1167,8 @@ fn instantiate_fs(file_system_instance: &UnionFs, path: &PathBuf, parent_inode_v
                     );
 
                     let actual_content = fs::read(&pathh).unwrap();
+                    let tmp_hm: HashMap<i32, u64> = HashMap::new();
+                    let writable_parent_hm: RwLock<HashMap<i32, u64>> = RwLock::new(tmp_hm);
 
                     let new_node = InodeContent {
                         inode_attributes: file_attr,
@@ -1051,6 +1176,7 @@ fn instantiate_fs(file_system_instance: &UnionFs, path: &PathBuf, parent_inode_v
                             file_content: RwLock::new(actual_content),
                             is_this_in_writable_path: false,
                             is_this_in_readable_path: true,
+                            writable_parent_instance: writable_parent_hm,
                         },
                     };
 
