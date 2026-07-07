@@ -3,7 +3,7 @@ use fuser::{
     MountOption,
 };
 
-use procfs::process::Process;
+use procfs::process::{self, Process};
 use std::{
     cmp::min,
     collections::HashMap,
@@ -189,6 +189,7 @@ impl UnionFs {
                 .unwrap()
                 .try_read()
                 .unwrap();
+            println!("printing readable children hm : {:?}", readable_children);
 
             let readable_children_iter = readable_children.iter();
 
@@ -464,8 +465,12 @@ impl Filesystem for UnionFs {
                         println!("not found writable root inode path");
                     }
 
-                    if writable_inode.is_some() && readable_inode.is_some()
-                        || writable_inode.is_some() && readable_inode.is_none()
+                    if writable_inode.is_some()
+                        && readable_inode.is_some()
+                        && writable_inode.unwrap() != 0
+                        || writable_inode.is_some()
+                            && readable_inode.is_none()
+                            && writable_inode.unwrap() != 0
                     {
                         let global_state = self.inode_to_content_mapping.try_read().unwrap();
                         let attr = global_state.get(&writable_inode.unwrap()).unwrap();
@@ -535,9 +540,6 @@ impl Filesystem for UnionFs {
                             attr.node_kind
                                 .update_writable_parent_instance(ses_id, parent.0);
                         }
-                        attr.node_kind
-                            .update_writable_parent_instance(ses_id, parent.0);
-
                         reply.entry(&dur, &attr.inode_attributes, Generation(1));
                     } else {
                         println!(
@@ -639,12 +641,28 @@ impl Filesystem for UnionFs {
 
     fn readdir(
         &self,
-        _req: &fuser::Request,
-        writable_dir_inode: INodeNo,
+        req: &fuser::Request,
+        mut writable_dir_inode: INodeNo,
         _fh: FileHandle,
         offset: u64,
         mut reply: fuser::ReplyDirectory,
     ) {
+        let comm_pid = req.pid() as i32;
+        println!("The request pid is : {}", comm_pid);
+        if writable_dir_inode.0 == 1
+            && let Ok(proc) = Process::new(comm_pid)
+            && let Ok(stat) = proc.stat()
+        {
+            if let Some(val) = self
+                .session_id_mapping
+                .try_read()
+                .unwrap()
+                .get(&stat.tty_nr)
+            {
+                writable_dir_inode.0 = *val;
+            }
+        }
+
         println!("The writbale inode is {}", writable_dir_inode.0);
 
         let mut aggregate: Vec<(u64, FileType, String)> = Vec::new();
@@ -659,6 +677,7 @@ impl Filesystem for UnionFs {
             .unwrap()
             .try_read()
             .unwrap();
+        println!("The writable hm is : {:?}", writable_hm);
         let writable_iter = writable_hm.iter();
 
         for (name, inode_val) in writable_iter {
@@ -668,8 +687,13 @@ impl Filesystem for UnionFs {
             }
             to_be_ommited.push(name.to_string());
             let file_type = global_mapping.get(inode_val).unwrap().get_inode_kind();
-            aggregate.push((*inode_val, file_type, name.to_string()));
+            if *inode_val != 0 {
+                println!("inode val of : {}", *inode_val);
+                aggregate.push((*inode_val, file_type, name.to_string()));
+            }
         }
+
+        println!("I am printing to be ommited : {:?}", to_be_ommited);
         if let Some(readable_dir_inode1) = self
             .writable_to_readable_inode
             .try_read()
@@ -688,10 +712,15 @@ impl Filesystem for UnionFs {
 
             for (name, inode_val) in readable_iter {
                 if to_be_ommited.contains(name) {
+                    println!("skipped : {}", name);
                     continue;
                 }
-                let file_type = global_mapping.get(inode_val).unwrap().get_inode_kind();
-                aggregate.push((*inode_val, file_type, name.to_string()));
+                if let Some(final_type) = global_mapping.get(inode_val) {
+                    let file_type = final_type.get_inode_kind();
+                    aggregate.push((*inode_val, file_type, name.to_string()));
+                } else {
+                    println!("encountered deleted file : {}", name);
+                }
             }
         }
 
@@ -1034,8 +1063,10 @@ impl Filesystem for UnionFs {
             let tmp = parent_hm.get(&name.to_string_lossy().to_string());
 
             if tmp.is_some() {
+                // this branch means that the file exists in the writable hm
                 deleted_inode_val = *tmp.unwrap();
             } else {
+                // this means it does not exist in teh writable hm
                 println!("Does it enter here");
                 let writable_to_readable_mapping =
                     self.writable_to_readable_inode.try_read().unwrap();
@@ -1043,17 +1074,26 @@ impl Filesystem for UnionFs {
                     .get(&parent.0)
                     .unwrap()
                     .unwrap();
+                // next step is to fin
             }
 
             let child_instance = global_mapping.get(&deleted_inode_val).unwrap();
-            readable_path_presence = child_instance
-                .node_kind
-                .is_it_present_in_readable_path()
-                .unwrap();
-            writable_path_presence = child_instance
-                .node_kind
-                .is_it_present_in_writable_path()
-                .unwrap();
+            if let Some(tmp) = child_instance.node_kind.is_it_present_in_writable_path()
+                && tmp
+            {
+                writable_path_presence = true;
+            } else {
+                // writable path returned None
+                writable_path_presence = false;
+            }
+
+            if let Some(tmp) = child_instance.node_kind.is_it_present_in_readable_path()
+                && tmp
+            {
+                readable_path_presence = true;
+            } else {
+                readable_path_presence = false;
+            }
             println!("writable path : {:?}", writable_path_presence);
         }
 
@@ -1082,13 +1122,9 @@ impl Filesystem for UnionFs {
                 let mut inode_to_string_mapping = self.inode_to_string_mapping.try_write().unwrap();
                 inode_to_string_mapping.remove_entry(&deleted_inode_val);
             }
-        } else {
-            println!(
-                "we have gotten readable path here, where the actual file in the readable part is : {}",
-                deleted_inode_val
-            );
-
+        } else if parent.0 == 1 {
             let global_mapping = self.inode_to_content_mapping.try_read().unwrap();
+            //let tmp = global_mapping.get(&deleted_inode_val).unwrap();
             let comm_pid = req.pid() as i32;
 
             if let Ok(proc) = Process::new(comm_pid)
@@ -1096,24 +1132,82 @@ impl Filesystem for UnionFs {
             {
                 let ses_id = stat.tty_nr;
                 println!("The session id is : {}", ses_id);
-                let writable_parent_inode = global_mapping
-                    .get(&deleted_inode_val)
+                let readable_parent_hm = global_mapping
+                    .get(&parent.0)
                     .unwrap()
+                    .node_kind
+                    .children_of_directory()
+                    .unwrap();
+                println!(
+                    "The readable parent hm is : {:?} and we are searching for name : {}",
+                    readable_parent_hm,
+                    name.to_string_lossy()
+                );
+                let tmp = readable_parent_hm.try_read().unwrap();
+                let readable_file_inode = tmp.get(&name.to_string_lossy().to_string()).unwrap();
+                let readable_file_instance = global_mapping.get(readable_file_inode).unwrap();
+                let writable_parent = readable_file_instance
                     .node_kind
                     .get_writable_parent_instance(ses_id)
                     .unwrap();
                 println!(
-                    "The writable parent inode value is : {}",
-                    writable_parent_inode
+                    "The wriatble parnet into which we are inserting is {}",
+                    writable_parent
                 );
-                let parent_instance = global_mapping.get(&writable_parent_inode).unwrap();
-                let mut parent_hm = parent_instance
+                let writable_parent_instance = global_mapping.get(&writable_parent).unwrap();
+                let mut writable_hm = writable_parent_instance
                     .node_kind
                     .children_of_directory()
                     .unwrap()
                     .try_write()
                     .unwrap();
-                parent_hm.insert(name.to_string_lossy().to_string(), 0);
+                writable_hm.insert(name.to_string_lossy().to_string(), 0);
+            }
+        } else {
+            println!(
+                "we have gotten readable path here, where the actual file in the readable part is : {}",
+                deleted_inode_val
+            );
+
+            let global_mapping = self.inode_to_content_mapping.try_read().unwrap();
+            let tmp = global_mapping.get(&deleted_inode_val).unwrap();
+            let comm_pid = req.pid() as i32;
+
+            if let Ok(proc) = Process::new(comm_pid)
+                && let Ok(stat) = proc.stat()
+            {
+                let ses_id = stat.tty_nr;
+                println!("The session id is : {}", ses_id);
+                let readable_parent_hm = global_mapping
+                    .get(&deleted_inode_val)
+                    .unwrap()
+                    .node_kind
+                    .children_of_directory()
+                    .unwrap();
+                println!(
+                    "The readable parent hm is : {:?} and we are searching for name : {}",
+                    readable_parent_hm,
+                    name.to_string_lossy()
+                );
+                let tmp = readable_parent_hm.try_read().unwrap();
+                let readable_file_inode = tmp.get(&name.to_string_lossy().to_string()).unwrap();
+                let readable_file_instance = global_mapping.get(readable_file_inode).unwrap();
+                let writable_parent = readable_file_instance
+                    .node_kind
+                    .get_writable_parent_instance(ses_id)
+                    .unwrap();
+                println!(
+                    "The wriatble parnet into which we are inserting is {}",
+                    writable_parent
+                );
+                let writable_parent_instance = global_mapping.get(&writable_parent).unwrap();
+                let mut writable_hm = writable_parent_instance
+                    .node_kind
+                    .children_of_directory()
+                    .unwrap()
+                    .try_write()
+                    .unwrap();
+                writable_hm.insert(name.to_string_lossy().to_string(), 0);
             }
         }
         reply.ok();
