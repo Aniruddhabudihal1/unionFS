@@ -1,11 +1,11 @@
 use fuser::{
     Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
-    MountOption,
+    MountOption, OpenFlags, WriteFlags,
 };
 
 use procfs::process::Process;
 use std::{
-    arch::global_asm,
+    clone,
     collections::HashMap,
     env, fs,
     path::PathBuf,
@@ -18,7 +18,8 @@ enum Node {
     Directory {
         hash_of_children: RwLock<HashMap<String, u64>>,
         writable_parent_instance: RwLock<HashMap<i32, u64>>,
-        present_solely_in_writable_path: RwLock<bool>,
+        is_this_in_readable_path: bool,
+        is_this_in_writable_path: bool,
     },
     File {
         file_content: RwLock<Vec<u8>>,
@@ -51,6 +52,7 @@ impl Node {
                 writable_parent_instance,
                 ..
             } => {
+                println!("writable instance hm : {:?}", writable_parent_instance);
                 writable_parent_instance
                     .try_write()
                     .unwrap()
@@ -65,13 +67,19 @@ impl Node {
             Self::Directory {
                 writable_parent_instance,
                 ..
-            } => Some(
-                *writable_parent_instance
-                    .try_read()
-                    .unwrap()
-                    .get(&ses_id)
-                    .unwrap(),
-            ),
+            } => {
+                println!(
+                    "getting writbale parent instance hm : {:?}",
+                    writable_parent_instance.try_read().unwrap()
+                );
+                Some(
+                    *writable_parent_instance
+                        .try_read()
+                        .unwrap()
+                        .get(&ses_id)
+                        .unwrap(),
+                )
+            }
             Self::File { .. } => None,
         }
     }
@@ -109,7 +117,10 @@ impl Node {
 
     fn is_it_present_in_readable_path(&self) -> Option<bool> {
         match self {
-            Node::Directory { .. } => None,
+            Node::Directory {
+                is_this_in_readable_path,
+                ..
+            } => Some(*is_this_in_readable_path),
             Node::File {
                 is_this_in_readable_path,
                 ..
@@ -119,7 +130,10 @@ impl Node {
 
     fn is_it_present_in_writable_path(&self) -> Option<bool> {
         match self {
-            Node::Directory { .. } => None,
+            Node::Directory {
+                is_this_in_writable_path,
+                ..
+            } => Some(*is_this_in_writable_path),
             Node::File {
                 is_this_in_writable_path,
                 ..
@@ -179,7 +193,8 @@ impl UnionFs {
             node_kind: Node::Directory {
                 hash_of_children: HashMap::new().into(),
                 writable_parent_instance: RwLock::new(HashMap::new()),
-                present_solely_in_writable_path: RwLock::new(false),
+                is_this_in_readable_path: true,
+                is_this_in_writable_path: false,
             },
         };
 
@@ -239,11 +254,14 @@ impl UnionFs {
                 let readable_instance = readable_content.get(ii).unwrap();
                 let readable_type = readable_instance.get_inode_kind();
                 if readable_type == FileType::Directory {
-                    println!("We are pushing {} which has parent {:?} ", ii, parent_name);
+                    println!(
+                        "We are pushing {} which has parent {:?} and session id : {} and its respective writable_root_inode is : {}",
+                        ii, parent_name, ses_id, writable_root_inode
+                    );
                     readable_children_vector.push(*ii);
                     readable_instance
                         .node_kind
-                        .update_writable_parent_instance_for_files(ses_id, writable_root_inode);
+                        .update_writable_parent_instance_for_dirs(ses_id, writable_root_inode);
                 } else if readable_type == FileType::RegularFile {
                     readable_content
                         .get(ii)
@@ -305,7 +323,8 @@ impl UnionFs {
                     node_kind: Node::Directory {
                         hash_of_children: RwLock::new(new_writable_hm),
                         writable_parent_instance: RwLock::new(HashMap::new()),
-                        present_solely_in_writable_path: RwLock::new(false),
+                        is_this_in_writable_path: true,
+                        is_this_in_readable_path: false,
                     },
                 };
 
@@ -468,7 +487,8 @@ impl Filesystem for UnionFs {
                         node_kind: Node::Directory {
                             hash_of_children: RwLock::new(new_hm),
                             writable_parent_instance: RwLock::new(HashMap::new()),
-                            present_solely_in_writable_path: RwLock::new(false),
+                            is_this_in_readable_path: false,
+                            is_this_in_writable_path: true,
                         },
                     };
 
@@ -767,7 +787,7 @@ impl Filesystem for UnionFs {
     ) {
         let mut present_in_writable_path = None;
         let mut present_in_readable_path = None;
-        println!("Enters the write function ");
+        println!("Enters the write function at offset of : {}", offset);
 
         {
             let inode_to_content_mapper = self.inode_to_content_mapping.try_read().unwrap();
@@ -785,6 +805,7 @@ impl Filesystem for UnionFs {
                     .unwrap(),
             );
         }
+        println!();
 
         if present_in_readable_path.unwrap() && !present_in_writable_path.unwrap() {
             increment_global_inode_val(self.curr_inode_val.try_write().unwrap());
@@ -907,8 +928,9 @@ impl Filesystem for UnionFs {
             }
         } else if present_in_writable_path.unwrap() {
             {
-                let mut global_mapper = self.inode_to_content_mapping.try_write().unwrap();
-                let content = global_mapper.get_mut(&ino.0).unwrap();
+                println!("comes into the writable path");
+                let global_mapper = self.inode_to_content_mapping.try_read().unwrap();
+                let content = global_mapper.get(&ino.0).unwrap();
 
                 let mut node_instance = content
                     .node_kind
@@ -917,15 +939,17 @@ impl Filesystem for UnionFs {
                     .try_write()
                     .unwrap();
 
-                let tmp = data.iter();
+                let data_iter = data.iter();
                 let mut counter = offset as usize;
-                let mut from_zero = 0 as usize;
-                for i in tmp {
-                    node_instance.insert(counter, *i);
+                for individual_byte_to_be_inserted in data_iter {
+                    println!(
+                        "we are inserting {} at {} from the start",
+                        *individual_byte_to_be_inserted, counter
+                    );
+                    node_instance.insert(counter, *individual_byte_to_be_inserted);
                     counter += 1;
-                    from_zero += 1;
                 }
-                reply.written(from_zero as u32);
+                reply.written(data.len() as u32);
             }
         }
     }
@@ -979,15 +1003,156 @@ impl Filesystem for UnionFs {
 
     fn rename(
         &self,
-        _req: &fuser::Request,
-        _parent: INodeNo,
-        _name: &std::ffi::OsStr,
-        _newparent: INodeNo,
-        _newname: &std::ffi::OsStr,
+        req: &fuser::Request,
+        parent: INodeNo,
+        name: &std::ffi::OsStr,
+        newparent: INodeNo,
+        newname: &std::ffi::OsStr,
         _flags: fuser::RenameFlags,
-        _reply: fuser::ReplyEmpty,
+        reply: fuser::ReplyEmpty,
     ) {
-        //TODO : need to complete
+        println!(
+            "updating from {} to {} with parent changing from {} to {}",
+            name.to_string_lossy(),
+            newname.to_string_lossy(),
+            parent.0,
+            newparent.0
+        );
+        let mut need_to_update_global_state = false;
+        let mut readable_content: Option<Vec<u8>> = None;
+        let mut old_hm: Option<HashMap<String, u64>> = None;
+
+        if parent.0 == 1
+            && parent.0 == newparent.0
+            && let Ok(proc) = Process::new(req.pid() as i32)
+            && let Ok(stat) = proc.stat()
+        {
+            let readable_child_inode: u64;
+            {
+                let val: u64;
+                let global_state = self.inode_to_content_mapping.try_read().unwrap();
+                let session_id_mapping = self.session_id_mapping.try_read().unwrap();
+                let writable_parent_inode = session_id_mapping.get(&stat.tty_nr).unwrap();
+                let writable_instance = global_state.get(writable_parent_inode).unwrap();
+                let mut writable_hm = writable_instance
+                    .node_kind
+                    .children_of_directory()
+                    .unwrap()
+                    .try_write()
+                    .unwrap();
+                if let Some(child_instance) = writable_hm.get(&name.to_string_lossy().to_string()) {
+                    // child exists in teh wriatble path
+                    val = *child_instance;
+                    writable_hm.insert(name.to_string_lossy().to_string(), 0);
+                    let mut inode_to_string_mappnig =
+                        self.inode_to_string_mapping.try_write().unwrap();
+                    inode_to_string_mappnig.remove_entry(&val);
+                    inode_to_string_mappnig.insert(val, newname.to_string_lossy().to_string());
+                } else {
+                    // child does not exist in teh wriatble path
+                    {
+                        increment_global_inode_val(self.curr_inode_val.try_write().unwrap());
+                    }
+                    val = *self.curr_inode_val.try_read().unwrap();
+                    need_to_update_global_state = true;
+                    writable_hm.insert(name.to_string_lossy().to_string(), 0);
+                    let mut inode_to_string_mappnig =
+                        self.inode_to_string_mapping.try_write().unwrap();
+                    inode_to_string_mappnig.insert(val, newname.to_string_lossy().to_string());
+                }
+                writable_hm.insert(newname.to_string_lossy().to_string(), val);
+                let root_parent_content = global_state.get(&parent.0).unwrap();
+                let root_hm = root_parent_content
+                    .node_kind
+                    .children_of_directory()
+                    .unwrap()
+                    .try_read()
+                    .unwrap();
+                let child = root_hm.get(&name.to_string_lossy().to_string()).unwrap();
+                let child_instance = global_state.get(&child).unwrap();
+                if child_instance.get_inode_kind() == FileType::RegularFile {
+                    readable_content = Some(
+                        child_instance
+                            .node_kind
+                            .get_file_content()
+                            .unwrap()
+                            .try_read()
+                            .unwrap()
+                            .to_vec(),
+                    );
+                    need_to_update_global_state = true;
+                } else {
+                    old_hm = Some(
+                        child_instance
+                            .node_kind
+                            .children_of_directory()
+                            .unwrap()
+                            .try_read()
+                            .unwrap()
+                            .clone(),
+                    );
+                    need_to_update_global_state = true;
+                }
+            }
+        } else if parent.0 == 1
+            && let Ok(proc) = Process::new(req.pid() as i32)
+            && let Ok(stat) = proc.stat()
+        {
+            {
+                let global_mapping = self.inode_to_content_mapping.try_read().unwrap();
+                let old_parent = global_mapping.get(&parent.0).unwrap();
+                let session_id_mapping = self.session_id_mapping.try_read().unwrap();
+                let old_writable_parent_inode = session_id_mapping.get(&stat.tty_nr).unwrap();
+
+                let old_writable_parent_instance =
+                    global_mapping.get(old_writable_parent_inode).unwrap();
+                let mut old_parent_writable_hm = old_writable_parent_instance
+                    .node_kind
+                    .children_of_directory()
+                    .unwrap()
+                    .try_write()
+                    .unwrap();
+                old_parent_writable_hm.insert(name.to_string_lossy().to_string(), 0);
+                increment_global_inode_val(self.curr_inode_val.try_write().unwrap());
+            }
+        }
+        if need_to_update_global_state {
+            {
+                let mut global_state = self.inode_to_content_mapping.try_write().unwrap();
+                if old_hm.is_some() {
+                    let new_inode_content = InodeContent {
+                        inode_attributes: make_attribute(
+                            *self.curr_inode_val.try_read().unwrap(),
+                            true,
+                        ),
+                        node_kind: Node::Directory {
+                            hash_of_children: RwLock::new(old_hm.unwrap()),
+                            writable_parent_instance: RwLock::new(HashMap::new()),
+                            is_this_in_readable_path: false,
+                            is_this_in_writable_path: true,
+                        },
+                    };
+                    global_state
+                        .insert(*self.curr_inode_val.try_read().unwrap(), new_inode_content);
+                } else if readable_content.is_some() {
+                    let new_inode_content = InodeContent {
+                        inode_attributes: make_attribute(
+                            *self.curr_inode_val.try_read().unwrap(),
+                            false,
+                        ),
+                        node_kind: Node::File {
+                            file_content: RwLock::new(readable_content.unwrap()),
+                            is_this_in_readable_path: false,
+                            is_this_in_writable_path: true,
+                            writable_parent_instance: RwLock::new(HashMap::new()),
+                        },
+                    };
+                    global_state
+                        .insert(*self.curr_inode_val.try_read().unwrap(), new_inode_content);
+                }
+            }
+        }
+        reply.ok();
     }
 
     fn rmdir(
@@ -1408,7 +1573,8 @@ impl Filesystem for UnionFs {
             node_kind: Node::Directory {
                 hash_of_children: bait_hm,
                 writable_parent_instance: RwLock::new(HashMap::new()),
-                present_solely_in_writable_path: RwLock::new(true),
+                is_this_in_readable_path: false,
+                is_this_in_writable_path: true,
             },
         };
         global_indode_mapping.insert(new_inode_val, new_inodecontent);
@@ -1675,7 +1841,8 @@ fn instantiate_fs(file_system_instance: &UnionFs, path: &PathBuf, parent_inode_v
                         node_kind: Node::Directory {
                             hash_of_children: RwLock::new(new_hm),
                             writable_parent_instance: RwLock::new(HashMap::new()),
-                            present_solely_in_writable_path: RwLock::new(false),
+                            is_this_in_readable_path: true,
+                            is_this_in_writable_path: false,
                         },
                     };
 
