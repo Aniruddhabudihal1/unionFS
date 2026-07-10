@@ -792,7 +792,7 @@ impl Filesystem for UnionFs {
     ) {
         let mut present_in_writable_path = None;
         let mut present_in_readable_path = None;
-        println!("Enters the write function at offset of : {}", offset);
+        println!("Enters the write function at offset of : {} ", offset);
 
         {
             let inode_to_content_mapper = self.inode_to_content_mapping.try_read().unwrap();
@@ -884,6 +884,7 @@ impl Filesystem for UnionFs {
                         .unwrap();
                     children_hm.insert(name, *self.curr_inode_val.try_read().unwrap());
 
+                    /*
                     let node = global_mapper
                         .get(&self.curr_inode_val.try_read().unwrap())
                         .unwrap();
@@ -905,6 +906,7 @@ impl Filesystem for UnionFs {
                     for vec_instance in readable_iter {
                         writable_instance_content.push(*vec_instance);
                     }
+                    */
                 }
             }
 
@@ -920,16 +922,22 @@ impl Filesystem for UnionFs {
                     .try_write()
                     .unwrap();
 
-                let mut start = offset as usize;
-                let initial_start_count = start;
-                let data_to_be_inserted = data.iter();
-                let mut written_amount = 0;
-                for i in data_to_be_inserted {
-                    start += 1;
-                    node_instance.insert(start, *i);
+                println!("The vec before inserting is {:?}", node_instance);
+
+                let data_iter = data.iter();
+                let mut counter = offset as usize;
+                for individual_byte_to_be_inserted in data_iter {
+                    println!(
+                        "we are inserting {} at {} from the start but this exists at this position right now : {}",
+                        *individual_byte_to_be_inserted,
+                        counter,
+                        node_instance.get(counter).unwrap()
+                    );
+                    node_instance.insert(counter, *individual_byte_to_be_inserted);
+                    counter += 1;
                 }
-                written_amount = start - initial_start_count;
-                reply.written(written_amount.try_into().unwrap());
+                println!("The vec after insreting is {:?}", node_instance);
+                reply.written(data.len() as u32);
             }
         } else if present_in_writable_path.unwrap() {
             {
@@ -948,8 +956,10 @@ impl Filesystem for UnionFs {
                 let mut counter = offset as usize;
                 for individual_byte_to_be_inserted in data_iter {
                     println!(
-                        "we are inserting {} at {} from the start",
-                        *individual_byte_to_be_inserted, counter
+                        "we are inserting {} at {} from the start but this exists at this position right now : {}",
+                        *individual_byte_to_be_inserted,
+                        counter,
+                        node_instance.get(counter).unwrap()
                     );
                     node_instance.insert(counter, *individual_byte_to_be_inserted);
                     counter += 1;
@@ -2185,6 +2195,7 @@ fn instantiate_fs(file_system_instance: &UnionFs, path: &PathBuf, parent_inode_v
                     );
 
                     let actual_content = fs::read(&pathh).unwrap();
+                    println!("The content getting read is : {:?}", actual_content);
                     let tmp_hm: HashMap<i32, u64> = HashMap::new();
                     let writable_parent_hm: RwLock<HashMap<i32, u64>> = RwLock::new(tmp_hm);
 
