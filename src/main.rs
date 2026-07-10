@@ -1,11 +1,10 @@
 use fuser::{
     Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
-    MountOption, OpenFlags, WriteFlags,
+    MountOption,
 };
 
 use procfs::process::Process;
 use std::{
-    clone,
     collections::HashMap,
     env, fs,
     path::PathBuf,
@@ -1027,7 +1026,6 @@ impl Filesystem for UnionFs {
             && let Ok(proc) = Process::new(req.pid() as i32)
             && let Ok(stat) = proc.stat()
         {
-            let readable_child_inode: u64;
             {
                 let val: u64;
                 let global_state = self.inode_to_content_mapping.try_read().unwrap();
@@ -1098,9 +1096,9 @@ impl Filesystem for UnionFs {
             && let Ok(proc) = Process::new(req.pid() as i32)
             && let Ok(stat) = proc.stat()
         {
+            let mut old_writable_child_inode: Option<u64> = None;
             {
                 let global_mapping = self.inode_to_content_mapping.try_read().unwrap();
-                let old_parent = global_mapping.get(&parent.0).unwrap();
                 let session_id_mapping = self.session_id_mapping.try_read().unwrap();
                 let old_writable_parent_inode = session_id_mapping.get(&stat.tty_nr).unwrap();
 
@@ -1112,10 +1110,198 @@ impl Filesystem for UnionFs {
                     .unwrap()
                     .try_write()
                     .unwrap();
-                old_parent_writable_hm.insert(name.to_string_lossy().to_string(), 0);
-                increment_global_inode_val(self.curr_inode_val.try_write().unwrap());
+                if let Some(child_inode) =
+                    old_parent_writable_hm.get(&name.to_string_lossy().to_string())
+                {
+                    old_writable_child_inode = Some(*child_inode);
+                    let child_instance = global_mapping.get(child_inode).unwrap();
+                    if child_instance.get_inode_kind() == FileType::RegularFile {
+                        readable_content = Some(
+                            child_instance
+                                .node_kind
+                                .get_file_content()
+                                .unwrap()
+                                .try_read()
+                                .unwrap()
+                                .to_vec(),
+                        );
+                        need_to_update_global_state = true;
+                    } else {
+                        old_hm = Some(
+                            child_instance
+                                .node_kind
+                                .children_of_directory()
+                                .unwrap()
+                                .try_read()
+                                .unwrap()
+                                .clone(),
+                        );
+                        need_to_update_global_state = true;
+                    }
+                    old_parent_writable_hm.insert(name.to_string_lossy().to_string(), 0);
+                    increment_global_inode_val(self.curr_inode_val.try_write().unwrap());
+                } else {
+                    let old_parent = global_mapping.get(&parent.0).unwrap();
+                    let old_parent_hm = old_parent
+                        .node_kind
+                        .children_of_directory()
+                        .unwrap()
+                        .try_read()
+                        .unwrap();
+                    let child_inode = old_parent_hm
+                        .get(&name.to_string_lossy().to_string())
+                        .unwrap();
+                    let child_instance = global_mapping.get(child_inode).unwrap();
+                    if child_instance.get_inode_kind() == FileType::RegularFile {
+                        readable_content = Some(
+                            child_instance
+                                .node_kind
+                                .get_file_content()
+                                .unwrap()
+                                .try_read()
+                                .unwrap()
+                                .to_vec(),
+                        );
+                    } else {
+                        old_hm = Some(
+                            child_instance
+                                .node_kind
+                                .children_of_directory()
+                                .unwrap()
+                                .try_read()
+                                .unwrap()
+                                .clone(),
+                        );
+                    }
+                    old_parent_writable_hm.insert(name.to_string_lossy().to_string(), 0);
+                }
+            }
+
+            if old_writable_child_inode.is_some() {
+                let mut global_mapping = self.inode_to_content_mapping.try_write().unwrap();
+                global_mapping.remove_entry(&old_writable_child_inode.unwrap());
+
+                let mut inode_string_mapping = self.inode_to_string_mapping.try_write().unwrap();
+                inode_string_mapping.remove_entry(&old_writable_child_inode.unwrap());
+            }
+
+            {
+                let global_mapping = self.inode_to_content_mapping.try_read().unwrap();
+                let new_parent = global_mapping.get(&newparent.0).unwrap();
+                let mut new_hm = new_parent
+                    .node_kind
+                    .children_of_directory()
+                    .unwrap()
+                    .try_write()
+                    .unwrap();
+                if let Some(child) = new_hm.get(&newname.to_string_lossy().to_string()) {
+                    // child with the name already exists hence must return error
+                    if *child != 0 {
+                        println!("child with the name already exists in the new parent")
+                    } else {
+                        {
+                            increment_global_inode_val(self.curr_inode_val.try_write().unwrap());
+                        }
+                        new_hm.insert(
+                            newname.to_string_lossy().to_string(),
+                            *self.curr_inode_val.try_read().unwrap(),
+                        );
+                        need_to_update_global_state = true;
+                    }
+                } else {
+                    {
+                        increment_global_inode_val(self.curr_inode_val.try_write().unwrap());
+                    }
+                    new_hm.insert(
+                        newname.to_string_lossy().to_string(),
+                        *self.curr_inode_val.try_read().unwrap(),
+                    );
+                    need_to_update_global_state = true;
+                }
+            }
+        } else if parent.0 != 0 && parent.0 != newparent.0 {
+            let mut old_child_inode: Option<u64> = None;
+            {
+                let global_mapping = self.inode_to_content_mapping.try_read().unwrap();
+                let initial_parent_instance = global_mapping.get(&parent.0).unwrap();
+                let mut initial_hm = initial_parent_instance
+                    .node_kind
+                    .children_of_directory()
+                    .unwrap()
+                    .try_write()
+                    .unwrap();
+
+                if let Some(val) = initial_hm.get(&name.to_string_lossy().to_string()) {
+                    old_child_inode = Some(*val);
+                    let child_instance = global_mapping.get(val).unwrap();
+                    if child_instance.get_inode_kind() == FileType::RegularFile {
+                        readable_content = Some(
+                            child_instance
+                                .node_kind
+                                .get_file_content()
+                                .unwrap()
+                                .try_read()
+                                .unwrap()
+                                .to_vec(),
+                        );
+                        initial_hm.insert(name.to_string_lossy().to_string(), 0);
+                    } else {
+                        old_hm = Some(
+                            child_instance
+                                .node_kind
+                                .children_of_directory()
+                                .unwrap()
+                                .try_read()
+                                .unwrap()
+                                .clone(),
+                        );
+                        initial_hm.insert(name.to_string_lossy().to_string(), 0);
+                    }
+                } else {
+                    need_to_update_global_state = false;
+                }
+            }
+
+            if need_to_update_global_state {
+                let global_mapping = self.inode_to_content_mapping.try_read().unwrap();
+                let new_parent_instance = global_mapping.get(&newparent.0).unwrap();
+                let new_hm = new_parent_instance
+                    .node_kind
+                    .children_of_directory()
+                    .unwrap()
+                    .try_read()
+                    .unwrap();
+                need_to_update_global_state =
+                    new_hm.get(&newname.to_string_lossy().to_string()).is_none()
+            }
+
+            if need_to_update_global_state {
+                {
+                    increment_global_inode_val(self.curr_inode_val.try_write().unwrap());
+                }
+                let global_mapping = self.inode_to_content_mapping.try_read().unwrap();
+                let new_parent_instance = global_mapping.get(&newparent.0).unwrap();
+                let mut new_hm = new_parent_instance
+                    .node_kind
+                    .children_of_directory()
+                    .unwrap()
+                    .try_write()
+                    .unwrap();
+                new_hm.insert(
+                    newname.to_string_lossy().to_string(),
+                    *self.curr_inode_val.try_read().unwrap(),
+                );
+            }
+
+            if need_to_update_global_state {
+                let mut global_mapping = self.inode_to_content_mapping.try_write().unwrap();
+                global_mapping.remove_entry(&old_child_inode.unwrap());
+
+                let mut inode_string_mapping = self.inode_to_string_mapping.try_write().unwrap();
+                inode_string_mapping.remove_entry(&old_child_inode.unwrap());
             }
         }
+
         if need_to_update_global_state {
             {
                 let mut global_state = self.inode_to_content_mapping.try_write().unwrap();
@@ -1151,8 +1337,10 @@ impl Filesystem for UnionFs {
                         .insert(*self.curr_inode_val.try_read().unwrap(), new_inode_content);
                 }
             }
+            reply.ok();
+        } else {
+            reply.error(Errno::ENOENT);
         }
-        reply.ok();
     }
 
     fn rmdir(
@@ -1453,6 +1641,7 @@ impl Filesystem for UnionFs {
         reply.ok();
     }
 
+    //TODO : need to handle the case where there exists a node with the same name already
     fn mknod(
         &self,
         _req: &fuser::Request,
@@ -1505,6 +1694,7 @@ impl Filesystem for UnionFs {
         reply.entry(&dur, &new_attrs, Generation(1));
     }
 
+    //TODO : need to handle the case where there exists a node with the same name already
     fn mkdir(
         &self,
         req: &fuser::Request,
@@ -1586,6 +1776,7 @@ impl Filesystem for UnionFs {
         reply.entry(&dur, &new_attrs, Generation(1));
     }
 
+    //TODO:: need to handle the case where there already exists a node with the same name to be created
     fn create(
         &self,
         req: &fuser::Request,
