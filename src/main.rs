@@ -1694,16 +1694,16 @@ impl Filesystem for UnionFs {
         reply.entry(&dur, &new_attrs, Generation(1));
     }
 
-    //TODO : need to handle the case where there exists a node with the same name already
     fn mkdir(
         &self,
         req: &fuser::Request,
         parent: INodeNo,
         name: &std::ffi::OsStr,
-        mode: u32,
-        umask: u32,
+        _mode: u32,
+        _umask: u32,
         reply: fuser::ReplyEntry,
     ) {
+        let mut final_status = Some(false);
         {
             increment_global_inode_val(self.curr_inode_val.try_write().unwrap());
         }
@@ -1728,13 +1728,28 @@ impl Filesystem for UnionFs {
                 .try_write()
                 .unwrap();
 
-            writable_children.insert(name.to_string_lossy().to_string(), new_inode_val);
-            println!(
-                "Inserted directory with name {} and inode value : {} which has parent {}",
-                name.to_string_lossy(),
-                new_inode_val,
-                parent.0
-            );
+            let root_instance = global_mapper.get(&parent.0).unwrap();
+            let root_hm = root_instance
+                .node_kind
+                .children_of_directory()
+                .unwrap()
+                .try_read()
+                .unwrap();
+
+            if writable_children
+                .get(&name.to_string_lossy().to_string())
+                .is_none()
+                && root_hm.get(&name.to_string_lossy().to_string()).is_none()
+            {
+                writable_children.insert(name.to_string_lossy().to_string(), new_inode_val);
+                println!(
+                    "Inserted directory with name {} and inode value : {} which has parent {}",
+                    name.to_string_lossy(),
+                    new_inode_val,
+                    parent.0
+                );
+                final_status = Some(true);
+            }
         } else {
             let parent_instance = self.inode_to_content_mapping.try_read().unwrap();
             let mut parent_hm = parent_instance
@@ -1746,37 +1761,43 @@ impl Filesystem for UnionFs {
                 .try_write()
                 .unwrap();
 
-            parent_hm.insert(name.to_string_lossy().to_string(), new_inode_val);
-            println!(
-                "Inserted directory with name {} and inode value : {} which has parent {}",
-                name.to_string_lossy(),
-                new_inode_val,
-                parent.0
-            );
+            if parent_hm.get(&name.to_string_lossy().to_string()).is_none() {
+                parent_hm.insert(name.to_string_lossy().to_string(), new_inode_val);
+                println!(
+                    "Inserted directory with name {} and inode value : {} which has parent {}",
+                    name.to_string_lossy(),
+                    new_inode_val,
+                    parent.0
+                );
+                final_status = Some(true);
+            }
         }
 
-        let mut global_indode_mapping = self.inode_to_content_mapping.try_write().unwrap();
-        let new_attrs = make_attribute(new_inode_val, true);
-        let bait_hm: RwLock<HashMap<String, u64>> = RwLock::new(HashMap::new());
-        let new_inodecontent = InodeContent {
-            inode_attributes: new_attrs,
-            node_kind: Node::Directory {
-                hash_of_children: bait_hm,
-                writable_parent_instance: RwLock::new(HashMap::new()),
-                is_this_in_readable_path: false,
-                is_this_in_writable_path: true,
-            },
-        };
-        global_indode_mapping.insert(new_inode_val, new_inodecontent);
+        if final_status.unwrap() {
+            let mut global_indode_mapping = self.inode_to_content_mapping.try_write().unwrap();
+            let new_attrs = make_attribute(new_inode_val, true);
+            let bait_hm: RwLock<HashMap<String, u64>> = RwLock::new(HashMap::new());
+            let new_inodecontent = InodeContent {
+                inode_attributes: new_attrs,
+                node_kind: Node::Directory {
+                    hash_of_children: bait_hm,
+                    writable_parent_instance: RwLock::new(HashMap::new()),
+                    is_this_in_readable_path: false,
+                    is_this_in_writable_path: true,
+                },
+            };
+            global_indode_mapping.insert(new_inode_val, new_inodecontent);
 
-        let mut writable_to_readable_instance =
-            self.writable_to_readable_inode.try_write().unwrap();
-        writable_to_readable_instance.insert(new_inode_val, None);
-        let dur = Duration::default();
-        reply.entry(&dur, &new_attrs, Generation(1));
+            let mut writable_to_readable_instance =
+                self.writable_to_readable_inode.try_write().unwrap();
+            writable_to_readable_instance.insert(new_inode_val, None);
+            let dur = Duration::default();
+            reply.entry(&dur, &new_attrs, Generation(1));
+        } else {
+            reply.error(Errno::EEXIST);
+        }
     }
 
-    //TODO:: need to handle the case where there already exists a node with the same name to be created
     fn create(
         &self,
         req: &fuser::Request,
@@ -1788,11 +1809,7 @@ impl Filesystem for UnionFs {
         reply: fuser::ReplyCreate,
     ) {
         println!("calling create for {}", name.to_string_lossy());
-        {
-            increment_global_inode_val(self.curr_inode_val.try_write().unwrap());
-        }
-        let new_inode_val = *self.curr_inode_val.try_read().unwrap();
-
+        let mut final_status: Option<bool> = Some(false);
         let comm_pid = req.pid() as i32;
         if parent.0 == 1
             && let Ok(proc) = Process::new(comm_pid)
@@ -1812,7 +1829,25 @@ impl Filesystem for UnionFs {
                 .try_write()
                 .unwrap();
 
-            writable_children.insert(name.to_string_lossy().to_string(), new_inode_val);
+            let root_instance = global_mapper.get(&parent.0).unwrap();
+            let root_hm = root_instance
+                .node_kind
+                .children_of_directory()
+                .unwrap()
+                .try_read()
+                .unwrap();
+
+            let writable_status = writable_children.get(&name.to_string_lossy().to_string());
+            let readable_status = root_hm.get(&name.to_string_lossy().to_string());
+            if readable_status.is_some() && writable_status.is_some() {
+                {
+                    increment_global_inode_val(self.curr_inode_val.try_write().unwrap());
+                }
+                let new_inode_val = *self.curr_inode_val.try_read().unwrap();
+
+                writable_children.insert(name.to_string_lossy().to_string(), new_inode_val);
+                final_status = Some(true);
+            }
         } else {
             let parent_instance = self.inode_to_content_mapping.try_read().unwrap();
             let mut parent_hm = parent_instance
@@ -1824,45 +1859,53 @@ impl Filesystem for UnionFs {
                 .try_write()
                 .unwrap();
 
-            parent_hm.insert(name.to_string_lossy().to_string(), new_inode_val);
-            println!(
-                "Inserted file with name {} and inode value : {} which has parent {}",
-                name.to_string_lossy(),
-                new_inode_val,
-                parent.0
-            );
+            if parent_hm.get(&name.to_string_lossy().to_string()).is_none() {
+                {
+                    increment_global_inode_val(self.curr_inode_val.try_write().unwrap());
+                }
+                let new_inode_val = *self.curr_inode_val.try_read().unwrap();
+                parent_hm.insert(name.to_string_lossy().to_string(), new_inode_val);
+                println!(
+                    "Inserted file with name {} and inode value : {} which has parent {}",
+                    name.to_string_lossy(),
+                    new_inode_val,
+                    parent.0
+                );
+                final_status = Some(true);
+            }
         }
 
-        let mut global_indode_mapping = self.inode_to_content_mapping.try_write().unwrap();
-        let new_vec: RwLock<Vec<u8>> = RwLock::new(Vec::new());
-        let new_attrs = make_attribute(new_inode_val, false);
-        let bait_hm: RwLock<HashMap<i32, u64>> = RwLock::new(HashMap::new());
-        let new_inodecontent = InodeContent {
-            inode_attributes: new_attrs,
-            node_kind: Node::File {
-                file_content: new_vec,
-                is_this_in_readable_path: false,
-                is_this_in_writable_path: true,
-                writable_parent_instance: bait_hm,
-            },
-        };
-        global_indode_mapping.insert(new_inode_val, new_inodecontent);
+        if final_status.unwrap() {
+            let new_inode_val = *self.curr_inode_val.try_read().unwrap();
+            let mut global_indode_mapping = self.inode_to_content_mapping.try_write().unwrap();
+            let new_vec: RwLock<Vec<u8>> = RwLock::new(Vec::new());
+            let new_attrs = make_attribute(new_inode_val, false);
+            let bait_hm: RwLock<HashMap<i32, u64>> = RwLock::new(HashMap::new());
+            let new_inodecontent = InodeContent {
+                inode_attributes: new_attrs,
+                node_kind: Node::File {
+                    file_content: new_vec,
+                    is_this_in_readable_path: false,
+                    is_this_in_writable_path: true,
+                    writable_parent_instance: bait_hm,
+                },
+            };
+            global_indode_mapping.insert(new_inode_val, new_inodecontent);
 
-        let mut writable_to_readable_instance =
-            self.writable_to_readable_inode.try_write().unwrap();
-        writable_to_readable_instance.insert(new_inode_val, None);
-        let dur = Duration::default();
-        reply.created(
-            &dur,
-            &new_attrs,
-            Generation(0),
-            FileHandle(*self.curr_file_handle.try_read().unwrap()),
-            FopenFlags::FOPEN_DIRECT_IO,
-        );
-    }
-
-    fn statfs(&self, _req: &fuser::Request, _ino: INodeNo, reply: fuser::ReplyStatfs) {
-        //TODO: Need to complete
+            let mut writable_to_readable_instance =
+                self.writable_to_readable_inode.try_write().unwrap();
+            writable_to_readable_instance.insert(new_inode_val, None);
+            let dur = Duration::default();
+            reply.created(
+                &dur,
+                &new_attrs,
+                Generation(0),
+                FileHandle(*self.curr_file_handle.try_read().unwrap()),
+                FopenFlags::FOPEN_DIRECT_IO,
+            );
+        } else {
+            reply.error(Errno::EEXIST);
+        }
     }
 }
 
