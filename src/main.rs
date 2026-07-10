@@ -6,7 +6,8 @@ use fuser::{
 use procfs::process::Process;
 use std::{
     collections::HashMap,
-    env, fs,
+    env,
+    fs::{self, read},
     path::PathBuf,
     sync::{RwLock, RwLockWriteGuard},
     time::{Duration, SystemTime},
@@ -738,7 +739,12 @@ impl Filesystem for UnionFs {
     ) {
         println!("getattr got invoked for inode value : {}", ino.0);
         let d = Duration::default();
-        if let Some(in_content) = self.inode_to_content_mapping.read().unwrap().get(&ino.0) {
+        if let Some(in_content) = self
+            .inode_to_content_mapping
+            .try_read()
+            .unwrap()
+            .get(&ino.0)
+        {
             reply.attr(&d, &in_content.inode_attributes);
         } else {
             reply.error(Errno::ENOENT);
@@ -1459,6 +1465,7 @@ impl Filesystem for UnionFs {
         reply.ok();
     }
 
+    /*
     fn unlink(
         &self,
         req: &fuser::Request,
@@ -1496,8 +1503,7 @@ impl Filesystem for UnionFs {
             } else {
                 // this means it does not exist in teh writable hm
                 println!("Does it enter here");
-                let writable_to_readable_mapping =
-                    self.writable_to_readable_inode.try_read().unwrap();
+                let writable_to_readable_mapping = self.writable_to_readable_inode.try_read().unwrap();
                 deleted_inode_val = writable_to_readable_mapping
                     .get(&parent.0)
                     .unwrap()
@@ -1640,8 +1646,152 @@ impl Filesystem for UnionFs {
         }
         reply.ok();
     }
+    */
 
-    //TODO : need to handle the case where there exists a node with the same name already
+    fn unlink(
+        &self,
+        req: &fuser::Request,
+        parent: INodeNo,
+        name: &std::ffi::OsStr,
+        reply: fuser::ReplyEmpty,
+    ) {
+        println!(
+            "unlink got inovked for : {} who has parent : {}",
+            name.to_string_lossy(),
+            parent.0
+        );
+        let mut final_status = Some(false);
+        let mut old_inode: Option<u64> = None;
+        if parent.0 == 1
+            && let Ok(proc) = Process::new(req.pid() as i32)
+            && let Ok(stat) = proc.stat()
+        {
+            {
+                let ses_id_mapping = self.session_id_mapping.try_read().unwrap();
+                let writable_root_inode = ses_id_mapping.get(&stat.tty_nr).unwrap();
+
+                let global_mapping = self.inode_to_content_mapping.try_read().unwrap();
+
+                let writable_instance = global_mapping.get(writable_root_inode).unwrap();
+                let mut writable_hm = writable_instance
+                    .node_kind
+                    .children_of_directory()
+                    .unwrap()
+                    .try_write()
+                    .unwrap();
+                println!("writable hm : {:?}", writable_hm);
+
+                let readable_instance = global_mapping.get(&parent.0).unwrap();
+                let readable_hm = readable_instance
+                    .node_kind
+                    .children_of_directory()
+                    .unwrap()
+                    .try_read()
+                    .unwrap();
+                println!("readable hm {:?}", readable_hm);
+
+                let wriatble_status = writable_hm.get(&name.to_string_lossy().to_string());
+                println!("the writable status is : {:?}", wriatble_status);
+
+                if wriatble_status.is_some()
+                    && readable_hm
+                        .get(&name.to_string_lossy().to_string())
+                        .is_some()
+                    || readable_hm
+                        .get(&name.to_string_lossy().to_string())
+                        .is_some()
+                        && wriatble_status.is_none()
+                    || wriatble_status.is_some()
+                        && readable_hm
+                            .get(&name.to_string_lossy().to_string())
+                            .is_none()
+                {
+                    println!("enters that large if clause");
+                    println!();
+                    if let Some(val) = wriatble_status {
+                        old_inode = Some(*val);
+                    }
+                    writable_hm.insert(name.to_string_lossy().to_string(), 0);
+                    final_status = Some(true);
+                }
+            }
+
+            if final_status.unwrap()
+                && let Some(old) = old_inode
+            {
+                let mut global_mapping = self.inode_to_content_mapping.try_write().unwrap();
+                global_mapping.remove_entry(&old);
+
+                let mut inode_to_string = self.inode_to_string_mapping.try_write().unwrap();
+                inode_to_string.remove_entry(&old);
+
+                let mut writable_to_readable_mapping =
+                    self.writable_to_readable_inode.try_write().unwrap();
+                if writable_to_readable_mapping.get(&old).unwrap().is_some() {
+                    writable_to_readable_mapping.remove_entry(&old);
+                }
+            }
+        } else {
+            {
+                let global_mapping = self.inode_to_content_mapping.try_read().unwrap();
+
+                let parent_instance = global_mapping.get(&parent.0).unwrap();
+                let mut parent_hm = parent_instance
+                    .node_kind
+                    .children_of_directory()
+                    .unwrap()
+                    .try_write()
+                    .unwrap();
+
+                if let Some(val) = parent_hm.get(&name.to_string_lossy().to_string()) {
+                    old_inode = Some(*val);
+                    parent_hm.insert(name.to_string_lossy().to_string(), 0);
+                    final_status = Some(true);
+                } else {
+                    let writable_to_readable = self.writable_to_readable_inode.try_read().unwrap();
+                    if let Some(corresponding_val) = writable_to_readable.get(&parent.0).unwrap() {
+                        let readable_instance = global_mapping.get(corresponding_val).unwrap();
+                        let readable_hm = readable_instance
+                            .node_kind
+                            .children_of_directory()
+                            .unwrap()
+                            .try_read()
+                            .unwrap();
+                        if readable_hm
+                            .get(&name.to_string_lossy().to_string())
+                            .is_some()
+                        {
+                            parent_hm.insert(name.to_string_lossy().to_string(), 0);
+                            final_status = Some(true);
+                        }
+                    }
+                }
+            }
+            if let Some(old_inode) = old_inode {
+                let mut global_mapping = self.inode_to_content_mapping.try_write().unwrap();
+                global_mapping.remove_entry(&old_inode);
+
+                let mut inode_to_string = self.inode_to_string_mapping.try_write().unwrap();
+                inode_to_string.remove_entry(&old_inode);
+
+                let mut writable_to_readable_mapping =
+                    self.writable_to_readable_inode.try_write().unwrap();
+                if writable_to_readable_mapping
+                    .get(&old_inode)
+                    .unwrap()
+                    .is_some()
+                {
+                    writable_to_readable_mapping.remove_entry(&old_inode);
+                }
+            }
+        }
+        if final_status.unwrap() {
+            reply.ok();
+        } else {
+            reply.error(Errno::ENOENT);
+        }
+    }
+
     fn mknod(
         &self,
         _req: &fuser::Request,
@@ -1828,6 +1978,8 @@ impl Filesystem for UnionFs {
                 .unwrap()
                 .try_write()
                 .unwrap();
+            println!("The writable hm is : {:?}", writable_children);
+            println!();
 
             let root_instance = global_mapper.get(&parent.0).unwrap();
             let root_hm = root_instance
@@ -1836,10 +1988,12 @@ impl Filesystem for UnionFs {
                 .unwrap()
                 .try_read()
                 .unwrap();
+            println!("The writable hm is : {:?}", root_hm);
+            println!();
 
             let writable_status = writable_children.get(&name.to_string_lossy().to_string());
             let readable_status = root_hm.get(&name.to_string_lossy().to_string());
-            if readable_status.is_some() && writable_status.is_some() {
+            if readable_status.is_none() && writable_status.is_none() {
                 {
                     increment_global_inode_val(self.curr_inode_val.try_write().unwrap());
                 }
@@ -1987,12 +2141,12 @@ fn instantiate_fs(file_system_instance: &UnionFs, path: &PathBuf, parent_inode_v
                         .try_write()
                         .unwrap();
                     inode_to_string_mapping.insert(
-                        *file_system_instance.curr_inode_val.read().unwrap(),
+                        *file_system_instance.curr_inode_val.try_read().unwrap(),
                         str_child_path.clone(),
                     );
                     println!(
                         "inserted name for : {} as {}",
-                        *file_system_instance.curr_inode_val.read().unwrap(),
+                        *file_system_instance.curr_inode_val.try_read().unwrap(),
                         str_child_path.clone()
                     );
 
@@ -2006,12 +2160,12 @@ fn instantiate_fs(file_system_instance: &UnionFs, path: &PathBuf, parent_inode_v
                         println!(
                             "The name of the thing being inserted : {} and the inode value being given to it is : {}",
                             str_child_path.clone(),
-                            *file_system_instance.curr_inode_val.read().unwrap()
+                            *file_system_instance.curr_inode_val.try_read().unwrap()
                         );
 
                         parent_hash.insert(
                             str_child_path.clone(),
-                            *file_system_instance.curr_inode_val.read().unwrap(),
+                            *file_system_instance.curr_inode_val.try_read().unwrap(),
                         );
                     } else {
                         println!("parent does not exist");
@@ -2020,8 +2174,10 @@ fn instantiate_fs(file_system_instance: &UnionFs, path: &PathBuf, parent_inode_v
 
                 if pathh.is_file() {
                     println!("file detected");
-                    let file_attr =
-                        make_attribute(*file_system_instance.curr_inode_val.read().unwrap(), false);
+                    let file_attr = make_attribute(
+                        *file_system_instance.curr_inode_val.try_read().unwrap(),
+                        false,
+                    );
 
                     println!(
                         "The file attribute in the readable path is : {:?}",
@@ -2048,7 +2204,7 @@ fn instantiate_fs(file_system_instance: &UnionFs, path: &PathBuf, parent_inode_v
                         match second_global_state {
                             Ok(mut r) => {
                                 r.insert(
-                                    *file_system_instance.curr_inode_val.read().unwrap(),
+                                    *file_system_instance.curr_inode_val.try_read().unwrap(),
                                     new_node,
                                 );
                                 drop(r);
@@ -2065,8 +2221,10 @@ fn instantiate_fs(file_system_instance: &UnionFs, path: &PathBuf, parent_inode_v
                 } else if pathh.is_dir() {
                     println!("Directory detected with name : {:?}", pathh.clone());
                     println!("And the path name is {}", str_child_path.clone());
-                    let file_attr =
-                        make_attribute(*file_system_instance.curr_inode_val.read().unwrap(), true);
+                    let file_attr = make_attribute(
+                        *file_system_instance.curr_inode_val.try_read().unwrap(),
+                        true,
+                    );
 
                     let new_hm: HashMap<String, u64> = HashMap::new();
 
@@ -2087,7 +2245,7 @@ fn instantiate_fs(file_system_instance: &UnionFs, path: &PathBuf, parent_inode_v
                             Ok(mut t) => {
                                 println!("ok now it inserted");
                                 t.insert(
-                                    *file_system_instance.curr_inode_val.read().unwrap(),
+                                    *file_system_instance.curr_inode_val.try_read().unwrap(),
                                     new_node,
                                 );
                                 drop(t);
@@ -2100,10 +2258,14 @@ fn instantiate_fs(file_system_instance: &UnionFs, path: &PathBuf, parent_inode_v
 
                     println!(
                         "the inode value being inserted is : {}",
-                        file_system_instance.curr_inode_val.read().unwrap().clone()
+                        file_system_instance
+                            .curr_inode_val
+                            .try_read()
+                            .unwrap()
+                            .clone()
                     );
 
-                    let tmp = *file_system_instance.curr_inode_val.read().unwrap();
+                    let tmp = *file_system_instance.curr_inode_val.try_read().unwrap();
                     println!("The parent inode value being called next is : {}", tmp);
                     println!();
                     instantiate_fs(file_system_instance, &pathh.clone(), tmp);
